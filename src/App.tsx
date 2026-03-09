@@ -248,13 +248,21 @@ interface Leg {
 // ── MTM Analyzer layout (resizable 40/60 split) ──────────────────────────────
 const columnHelper = createColumnHelper<Leg>();
 const fmtG = (v: number, dec = 4) => v === 0 ? '—' : Math.abs(v) < 0.0001 ? v.toExponential(2) : parseFloat(v.toFixed(dec)).toString();
+const fmtMtm = (v: number): string => {
+  const abs = Math.abs(v);
+  const sign = v >= 0 ? '+' : '-';
+  if (abs >= 1_00_00_000) return `${sign}₹${(abs / 1_00_00_000).toFixed(2)}Cr`;
+  if (abs >= 1_00_000)    return `${sign}₹${(abs / 1_00_000).toFixed(2)}L`;
+  if (abs >= 1_000)       return `${sign}₹${(abs / 1_000).toFixed(2)}K`;
+  return `${sign}₹${abs.toFixed(2)}`;
+};
 const fmtExpiry = (e: string) => new Date(`${e.slice(0, 4)}-${e.slice(4, 6)}-${e.slice(6, 8)}T00:00:00Z`).toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: '2-digit', timeZone: 'UTC' });
-const greekItems: { key: keyof Greeks; label: string; color: string; dec: number }[] = [
-  { key: 'delta', label: 'Δ', color: '#60a5fa', dec: 4 },
-  { key: 'theta', label: 'Θ', color: '#f59e0b', dec: 2 },
-  { key: 'vega', label: 'V', color: '#a78bfa', dec: 2 },
-  { key: 'iv', label: 'IV', color: '#34d399', dec: 2 },
-  { key: 'gamma', label: 'Γ', color: '#fb923c', dec: 5 },
+const greekItems: { key: keyof Greeks; label: string; name: string; color: string; dec: number }[] = [
+  { key: 'delta', label: 'Δ', name: 'Delta', color: '#60a5fa', dec: 4 },
+  { key: 'theta', label: 'Θ', name: 'Theta', color: '#f59e0b', dec: 2 },
+  { key: 'vega',  label: 'V', name: 'Vega',  color: '#a78bfa', dec: 2 },
+  { key: 'iv',    label: 'IV', name: 'IV',    color: '#34d399', dec: 2 },
+  { key: 'gamma', label: 'Γ', name: 'Gamma', color: '#fb923c', dec: 5 },
 ];
 
 function MtmGroupTable({ group, showGreeks, columns }: { group: { symbol: string; legs: Leg[] }, showGreeks: boolean, columns: any }) {
@@ -286,31 +294,48 @@ function MtmGroupTable({ group, showGreeks, columns }: { group: { symbol: string
         <span style={{ fontSize: 14, fontWeight: 800, color: sc.accent, letterSpacing: '0.04em' }}>{group.symbol}</span>
         <span style={{ fontSize: 12, color: '#6B7280', fontWeight: 500, paddingLeft: 4 }}>{group.legs.length} leg{group.legs.length > 1 ? 's' : ''}</span>
         <div style={{ flex: 1 }} />
-        <span style={{ fontSize: 16, fontWeight: 700, color: mtmColor, fontFamily: 'monospace' }}>{groupMtm >= 0 ? '+' : ''}{groupMtm.toFixed(2)}</span>
+        <span style={{ fontSize: 16, fontWeight: 700, color: mtmColor, fontFamily: 'monospace' }}>{fmtMtm(groupMtm)}</span>
         <span style={{ fontSize: 11, color: '#6B7280', fontWeight: 500, textTransform: 'uppercase', letterSpacing: '0.05em' }}>net mtm</span>
       </div>
       {/* TanStack Legs */}
-      {table.getRowModel().rows.map(row => (
-        <div key={row.id} style={{
-          background: 'var(--bg-inset)',
-          borderRadius: showGreeks ? 8 : 10,
-          padding: showGreeks ? 0 : '8px 10px',
-          border: '1px solid rgba(255,255,255,0.03)',
-          display: 'flex',
-          alignItems: showGreeks ? 'stretch' : 'center',
-          gap: showGreeks ? 0 : 6,
-          opacity: row.original.checked ? 1 : 0.45,
-          transition: 'opacity 0.2s',
-          boxShadow: showGreeks ? 'none' : '0 2px 4px rgba(0,0,0,0.1)',
-          overflow: 'hidden'
-        }}>
-          {row.getVisibleCells().map(cell => (
-            <React.Fragment key={cell.id}>
-              {flexRender(cell.column.columnDef.cell, cell.getContext())}
-            </React.Fragment>
-          ))}
-        </div>
-      ))}
+      {showGreeks ? (
+        table.getRowModel().rows.map(row => (
+          <div key={row.id} style={{
+            background: 'var(--bg-inset)',
+            borderRadius: 8,
+            border: '1px solid rgba(255,255,255,0.03)',
+            display: 'flex',
+            alignItems: 'stretch',
+            opacity: row.original.checked ? 1 : 0.45,
+            transition: 'opacity 0.2s',
+          }}>
+            {row.getVisibleCells().map(cell => (
+              <React.Fragment key={cell.id}>
+                {flexRender(cell.column.columnDef.cell, cell.getContext())}
+              </React.Fragment>
+            ))}
+          </div>
+        ))
+      ) : (
+        <table style={{ width: '100%', borderCollapse: 'separate', borderSpacing: '0 4px', tableLayout: 'fixed' }}>
+          <colgroup>
+            {table.getAllColumns().map(col => (
+              <col key={col.id} style={{ width: col.getSize() }} />
+            ))}
+          </colgroup>
+          <tbody>
+            {table.getRowModel().rows.map(row => (
+              <tr key={row.id} style={{ opacity: row.original.checked ? 1 : 0.45, transition: 'opacity 0.2s' }}>
+                {row.getVisibleCells().map(cell => (
+                  <td key={cell.id} style={{ padding: '0 3px', verticalAlign: 'middle' }}>
+                    {flexRender(cell.column.columnDef.cell, cell.getContext())}
+                  </td>
+                ))}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
     </div>
   );
 }
@@ -426,22 +451,146 @@ function MtmLayout({ visible, workerRef, workerReady, workerModeRef, mtmResultsC
 
 
   const stdColumns = useMemo(() => [
-    columnHelper.display({ id: 'type', header: () => <div style={{ display: 'flex', alignItems: 'center', gap: 4, flex: 1, minWidth: 0 }}><div style={{ width: 18, flexShrink: 0 }} /><div style={{ width: 22, flexShrink: 0 }} /><span style={{ fontSize: 13, color: '#9CA3AF', fontWeight: 700, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>Type</span></div>, cell: ({ row }) => { const leg = row.original; const isBuy = leg.action === 'B'; return <div style={{ display: 'flex', alignItems: 'center', gap: 6, flex: 1, minWidth: 0 }}><div onClick={() => updateLeg(leg.id, { checked: !leg.checked })} style={{ width: 20, height: 20, borderRadius: 6, background: leg.checked ? 'rgba(129,140,248,0.15)' : 'rgba(255,255,255,0.03)', border: `1px solid ${leg.checked ? 'rgba(129,140,248,0.5)' : 'rgba(255,255,255,0.1)'}`, display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0, cursor: 'pointer' }}>{leg.checked && <svg width="12" height="12" viewBox="0 0 10 10" fill="none"><path d="M2 5l2.5 2.5L8 3" stroke="#818cf8" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" /></svg>}</div><div onClick={() => updateLeg(leg.id, { action: leg.action === 'B' ? 'S' : 'B' })} style={{ width: 28, height: 28, borderRadius: 6, background: isBuy ? 'rgba(38,166,154,0.15)' : 'rgba(242,54,69,0.15)', border: `1px solid ${isBuy ? 'rgba(38,166,154,0.4)' : 'rgba(242,54,69,0.4)'}`, display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0, cursor: 'pointer' }}><span style={{ fontSize: 13, fontWeight: 800, color: isBuy ? '#26a69a' : '#f23645' }}>{leg.action}</span></div><div style={{ flex: 1, minWidth: 0, height: 28, borderRadius: 6, background: 'rgba(255,255,255,0.03)', border: '1px solid rgba(255,255,255,0.06)', display: 'flex', alignItems: 'center', justifyContent: 'center', overflow: 'hidden' }}><span style={{ fontSize: 13, fontWeight: 700, color: '#E2E8F0', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{leg.type}</span></div></div>; } }),
-    columnHelper.display({ id: 'lots', header: () => <span style={{ width: 90, flexShrink: 0, fontSize: 13, color: '#9CA3AF', fontWeight: 700 }}>Lots</span>, cell: ({ row }) => <div style={{ flexShrink: 0, width: 90, height: 28, display: 'flex', alignItems: 'center', background: 'rgba(255,255,255,0.02)', border: '1px solid rgba(255,255,255,0.06)', borderRadius: 6, overflow: 'hidden' }}><button onClick={() => updateLeg(row.original.id, { lots: Math.max(1, row.original.lots - 1) })} style={{ width: 24, height: 28, background: 'transparent', border: 'none', color: '#9CA3AF', cursor: 'pointer' }}>−</button><input type="number" value={row.original.lots} min={1} onChange={e => { const v = parseInt(e.target.value); if (!isNaN(v) && v >= 1) updateLeg(row.original.id, { lots: v }); }} onBlur={e => { const v = parseInt(e.target.value); updateLeg(row.original.id, { lots: isNaN(v) || v < 1 ? 1 : v }); }} style={{ width: 42, textAlign: 'center', fontSize: 13, fontWeight: 700, color: '#E2E8F0', background: 'transparent', border: 'none', outline: 'none', MozAppearance: 'textfield' }} /><button onClick={() => updateLeg(row.original.id, { lots: row.original.lots + 1 })} style={{ width: 24, height: 28, background: 'transparent', border: 'none', color: '#9CA3AF', cursor: 'pointer' }}>+</button></div> }),
-    columnHelper.display({ id: 'expiry', header: () => <span style={{ flex: 1.5, minWidth: 0, fontSize: 13, color: '#9CA3AF', fontWeight: 700 }}>Expiry</span>, cell: ({ row }) => <div style={{ flex: 1.5, minWidth: 0, height: 28, borderRadius: 6, background: 'rgba(255,255,255,0.02)', border: '1px solid rgba(255,255,255,0.06)', display: 'flex', alignItems: 'center', justifyContent: 'center', overflow: 'hidden' }}><span style={{ fontSize: 13, color: '#9CA3AF', fontWeight: 500 }}>{fmtExpiry(row.original.expiry)}</span></div> }),
-    columnHelper.display({ id: 'strike', header: () => <span style={{ flex: 1.2, minWidth: 0, fontSize: 13, color: '#9CA3AF', fontWeight: 700 }}>Strike</span>, cell: ({ row }) => <div style={{ flex: 1.2, minWidth: 0, height: 28, borderRadius: 6, background: 'rgba(255,255,255,0.02)', border: '1px solid rgba(255,255,255,0.06)', display: 'flex', alignItems: 'center', justifyContent: 'center', overflow: 'hidden' }}><span style={{ fontSize: 13, fontWeight: 700, color: '#60a5fa', fontFamily: 'monospace' }}>{row.original.strike}</span></div> }),
-    columnHelper.display({ id: 'price', header: () => <span style={{ flex: 1.2, minWidth: 0, fontSize: 13, color: '#9CA3AF', fontWeight: 700 }}>Price</span>, cell: ({ row }) => <div style={{ flex: 1.2, minWidth: 0, height: 28, borderRadius: 6, background: 'rgba(255,255,255,0.02)', border: '1px solid rgba(255,255,255,0.06)', display: 'flex', alignItems: 'center', justifyContent: 'center', overflow: 'hidden' }}><span style={{ fontSize: 13, fontWeight: 600, color: '#E2E8F0', fontFamily: 'monospace' }}>₹{row.original.price.toFixed(2)}</span></div> }),
-    columnHelper.display({ id: 'sep', header: () => <div style={{ width: 1, flexShrink: 0 }} />, cell: () => <div style={{ width: 1, height: 24, background: 'rgba(255,255,255,0.05)', flexShrink: 0 }} /> }),
-    columnHelper.display({ id: 'currLtp', header: () => <span style={{ flex: 1.2, minWidth: 0, fontSize: 13, color: '#9CA3AF', fontWeight: 700 }}>Curr LTP</span>, cell: ({ row }) => <div style={{ flex: 1.2, minWidth: 0, height: 28, borderRadius: 6, background: 'rgba(255,255,255,0.02)', border: '1px solid rgba(255,255,255,0.06)', display: 'flex', alignItems: 'center', justifyContent: 'center', overflow: 'hidden' }}><span style={{ fontSize: 13, fontWeight: 700, color: '#E2E8F0', fontFamily: 'monospace' }}>₹{row.original.currLtp > 0 ? row.original.currLtp.toFixed(2) : row.original.price.toFixed(2)}</span></div> }),
-    columnHelper.display({ id: 'spot', header: () => <span style={{ flex: 1.2, minWidth: 0, fontSize: 13, color: '#9CA3AF', fontWeight: 700 }}>Spot</span>, cell: ({ row }) => <div style={{ flex: 1.2, minWidth: 0, height: 28, borderRadius: 6, background: 'rgba(255,255,255,0.02)', border: '1px solid rgba(255,255,255,0.06)', display: 'flex', alignItems: 'center', justifyContent: 'center', overflow: 'hidden' }}><span style={{ fontSize: 13, fontWeight: 600, color: '#9CA3AF', fontFamily: 'monospace' }}>{row.original.entrySpot > 0 ? row.original.entrySpot.toFixed(2) : '—'}</span></div> }),
-    columnHelper.display({ id: 'time', header: () => <span style={{ flex: 1.2, minWidth: 0, fontSize: 13, color: '#9CA3AF', fontWeight: 700 }}>Time</span>, cell: ({ row }) => <div style={{ flex: 1.2, minWidth: 0, height: 28, borderRadius: 6, background: 'rgba(255,255,255,0.02)', border: '1px solid rgba(255,255,255,0.06)', display: 'flex', alignItems: 'center', justifyContent: 'center', overflow: 'hidden' }}><span style={{ fontSize: 13, fontWeight: 500, color: '#9CA3AF' }}>{row.original.entryTime}</span></div> }),
-    columnHelper.display({ id: 'mtm', header: () => <span style={{ flex: 1.5, minWidth: 0, fontSize: 13, color: '#9CA3AF', fontWeight: 700 }}>MTM</span>, cell: ({ row }) => { const leg = row.original; const currLtp = leg.currLtp > 0 ? leg.currLtp : leg.price; const diff = currLtp - leg.price; const mtm = (leg.action === 'B' ? diff : -diff) * leg.lots * (leg.lotSize || 1); const mtmColor = mtm >= 0 ? '#26a69a' : '#f23645'; return <div style={{ flex: 1.5, minWidth: 0, height: 28, borderRadius: 6, background: mtm >= 0 ? 'rgba(38,166,154,0.1)' : 'rgba(242,54,69,0.1)', border: `1px solid ${mtm >= 0 ? 'rgba(38,166,154,0.25)' : 'rgba(242,54,69,0.25)'}`, display: 'flex', alignItems: 'center', justifyContent: 'center', overflow: 'hidden', boxShadow: 'inset 0 1px 2px rgba(0,0,0,0.1)' }}><span style={{ fontSize: 14, fontWeight: 800, color: mtmColor, fontFamily: 'monospace' }}>{mtm >= 0 ? '+' : ''}{mtm.toFixed(2)}</span></div>; } }),
-    columnHelper.display({ id: 'delete', header: () => <div style={{ width: 22, flexShrink: 0 }} />, cell: ({ row }) => <button onClick={() => removeLeg(row.original.id)} style={{ width: 22, height: 22, flexShrink: 0, background: 'transparent', border: 'none', cursor: 'pointer', color: '#333333', display: 'flex', alignItems: 'center', justifyContent: 'center', borderRadius: 4 }} onMouseEnter={e => (e.currentTarget.style.color = '#f23645')} onMouseLeave={e => (e.currentTarget.style.color = '#333333')}><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><polyline points="3 6 5 6 21 6" /><path d="M19 6l-1 14H6L5 6" /><path d="M10 11v6M14 11v6" /><path d="M9 6V4h6v2" /></svg></button> })
+    columnHelper.display({
+      id: 'check', size: 28,
+      header: () => <span style={{ fontSize: 12, color: '#9CA3AF', fontWeight: 700 }}></span>,
+      cell: ({ row }) => {
+        const leg = row.original;
+        return (
+          <div onClick={() => updateLeg(leg.id, { checked: !leg.checked })}
+            style={{ width: 18, height: 18, borderRadius: 4, background: leg.checked ? 'rgba(129,140,248,0.15)' : 'rgba(255,255,255,0.03)', border: `1px solid ${leg.checked ? 'rgba(129,140,248,0.5)' : 'rgba(255,255,255,0.12)'}`, display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer', flexShrink: 0 }}>
+            {leg.checked && <svg width="10" height="10" viewBox="0 0 10 10" fill="none"><path d="M2 5l2.5 2.5L8 3" stroke="#818cf8" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" /></svg>}
+          </div>
+        );
+      }
+    }),
+    columnHelper.display({
+      id: 'action', size: 36,
+      header: () => <span style={{ fontSize: 12, color: '#9CA3AF', fontWeight: 700 }}>B/S</span>,
+      cell: ({ row }) => {
+        const leg = row.original; const isBuy = leg.action === 'B';
+        return (
+          <div onClick={() => updateLeg(leg.id, { action: isBuy ? 'S' : 'B' })}
+            style={{ width: 28, height: 26, borderRadius: 5, background: isBuy ? 'rgba(38,166,154,0.15)' : 'rgba(242,54,69,0.15)', border: `1px solid ${isBuy ? 'rgba(38,166,154,0.45)' : 'rgba(242,54,69,0.45)'}`, display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer' }}>
+            <span style={{ fontSize: 13, fontWeight: 800, color: isBuy ? '#26a69a' : '#f23645' }}>{leg.action}</span>
+          </div>
+        );
+      }
+    }),
+    columnHelper.display({
+      id: 'type', size: 44,
+      header: () => <span style={{ fontSize: 12, color: '#9CA3AF', fontWeight: 700 }}>Type</span>,
+      cell: ({ row }) => {
+        const leg = row.original;
+        return (
+          <div style={{ width: 36, height: 26, borderRadius: 5, background: 'rgba(255,255,255,0.04)', border: '1px solid rgba(255,255,255,0.08)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+            <span style={{ fontSize: 13, fontWeight: 700, color: leg.type === 'CE' ? '#facc15' : '#c084fc' }}>{leg.type}</span>
+          </div>
+        );
+      }
+    }),
+    columnHelper.display({
+      id: 'lots', size: 96,
+      header: () => <span style={{ fontSize: 12, color: '#9CA3AF', fontWeight: 700 }}>Lots</span>,
+      cell: ({ row }) => (
+        <div style={{ width: 88, height: 26, display: 'flex', alignItems: 'center', background: 'rgba(255,255,255,0.02)', border: '1px solid rgba(255,255,255,0.07)', borderRadius: 5, overflow: 'hidden' }}>
+          <button onClick={() => updateLeg(row.original.id, { lots: Math.max(1, row.original.lots - 1) })} style={{ width: 22, height: 26, background: 'transparent', border: 'none', color: '#6B7280', cursor: 'pointer', fontSize: 14, lineHeight: 1, flexShrink: 0 }}>−</button>
+          <input type="text" inputMode="numeric"
+            key={`lots-${row.original.id}-${row.original.lots}`}
+            defaultValue={row.original.lots}
+            onBlur={e => { const v = parseInt(e.target.value); const safe = isNaN(v) || v < 1 ? 1 : v; e.target.value = String(safe); updateLeg(row.original.id, { lots: safe }); }}
+            onKeyDown={e => { if (e.key === 'Enter') (e.target as HTMLInputElement).blur(); }}
+            style={{ flex: 1, textAlign: 'center', fontSize: 13, fontWeight: 700, color: '#E2E8F0', background: 'transparent', border: 'none', outline: 'none', minWidth: 0, width: 0 }} />
+          <button onClick={() => updateLeg(row.original.id, { lots: row.original.lots + 1 })} style={{ width: 22, height: 26, background: 'transparent', border: 'none', color: '#6B7280', cursor: 'pointer', fontSize: 14, lineHeight: 1, flexShrink: 0 }}>+</button>
+        </div>
+      )
+    }),
+    columnHelper.display({
+      id: 'expiry', size: 90,
+      header: () => <span style={{ fontSize: 12, color: '#9CA3AF', fontWeight: 700 }}>Expiry</span>,
+      cell: ({ row }) => (
+        <div style={{ height: 26, borderRadius: 5, background: 'rgba(255,255,255,0.02)', border: '1px solid rgba(255,255,255,0.07)', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '0 6px' }}>
+          <span style={{ fontSize: 13, color: '#9CA3AF', fontWeight: 500, whiteSpace: 'nowrap' }}>{fmtExpiry(row.original.expiry)}</span>
+        </div>
+      )
+    }),
+    columnHelper.display({
+      id: 'strike', size: 72,
+      header: () => <span style={{ fontSize: 12, color: '#9CA3AF', fontWeight: 700 }}>Strike</span>,
+      cell: ({ row }) => (
+        <div style={{ height: 26, borderRadius: 5, background: 'rgba(255,255,255,0.02)', border: '1px solid rgba(255,255,255,0.07)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+          <span style={{ fontSize: 13, fontWeight: 700, color: '#60a5fa', fontFamily: 'monospace' }}>{row.original.strike}</span>
+        </div>
+      )
+    }),
+    columnHelper.display({
+      id: 'price', size: 80,
+      header: () => <span style={{ fontSize: 12, color: '#9CA3AF', fontWeight: 700 }}>Price</span>,
+      cell: ({ row }) => (
+        <div style={{ height: 26, borderRadius: 5, background: 'rgba(255,255,255,0.02)', border: '1px solid rgba(255,255,255,0.07)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+          <span style={{ fontSize: 13, fontWeight: 600, color: '#D1D4DC', fontFamily: 'monospace' }}>₹{row.original.price.toFixed(2)}</span>
+        </div>
+      )
+    }),
+    columnHelper.display({
+      id: 'currLtp', size: 80,
+      header: () => <span style={{ fontSize: 12, color: '#9CA3AF', fontWeight: 700 }}>LTP</span>,
+      cell: ({ row }) => (
+        <div style={{ height: 26, borderRadius: 5, background: 'rgba(255,255,255,0.02)', border: '1px solid rgba(255,255,255,0.07)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+          <span style={{ fontSize: 13, fontWeight: 700, color: '#E2E8F0', fontFamily: 'monospace' }}>₹{(row.original.currLtp > 0 ? row.original.currLtp : row.original.price).toFixed(2)}</span>
+        </div>
+      )
+    }),
+    columnHelper.display({
+      id: 'spot', size: 80,
+      header: () => <span style={{ fontSize: 12, color: '#9CA3AF', fontWeight: 700 }}>Spot</span>,
+      cell: ({ row }) => (
+        <div style={{ height: 26, borderRadius: 5, background: 'rgba(255,255,255,0.02)', border: '1px solid rgba(255,255,255,0.07)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+          <span style={{ fontSize: 13, fontWeight: 600, color: '#6B7280', fontFamily: 'monospace' }}>{row.original.entrySpot > 0 ? row.original.entrySpot.toFixed(2) : '—'}</span>
+        </div>
+      )
+    }),
+    columnHelper.display({
+      id: 'time', size: 72,
+      header: () => <span style={{ fontSize: 12, color: '#9CA3AF', fontWeight: 700 }}>Time</span>,
+      cell: ({ row }) => (
+        <div style={{ height: 26, borderRadius: 5, background: 'rgba(255,255,255,0.02)', border: '1px solid rgba(255,255,255,0.07)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+          <span style={{ fontSize: 13, fontWeight: 500, color: '#6B7280' }}>{row.original.entryTime}</span>
+        </div>
+      )
+    }),
+    columnHelper.display({
+      id: 'mtm', size: 88,
+      header: () => <span style={{ fontSize: 12, color: '#9CA3AF', fontWeight: 700 }}>MTM</span>,
+      cell: ({ row }) => {
+        const leg = row.original;
+        const currLtp = leg.currLtp > 0 ? leg.currLtp : leg.price;
+        const mtm = (leg.action === 'B' ? currLtp - leg.price : leg.price - currLtp) * leg.lots * (leg.lotSize || 1);
+        const pos = mtm >= 0;
+        return (
+          <div style={{ height: 26, borderRadius: 5, background: pos ? 'rgba(38,166,154,0.1)' : 'rgba(242,54,69,0.1)', border: `1px solid ${pos ? 'rgba(38,166,154,0.25)' : 'rgba(242,54,69,0.25)'}`, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+            <span style={{ fontSize: 13, fontWeight: 800, color: pos ? '#26a69a' : '#f23645', fontFamily: 'monospace' }}>{fmtMtm(mtm)}</span>
+          </div>
+        );
+      }
+    }),
+    columnHelper.display({
+      id: 'delete', size: 32,
+      header: () => <span />,
+      cell: ({ row }) => (
+        <button onClick={() => removeLeg(row.original.id)}
+          style={{ width: 24, height: 24, background: 'transparent', border: 'none', cursor: 'pointer', color: '#374151', display: 'flex', alignItems: 'center', justifyContent: 'center', borderRadius: 4 }}
+          onMouseEnter={e => (e.currentTarget.style.color = '#f23645')}
+          onMouseLeave={e => (e.currentTarget.style.color = '#374151')}>
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><polyline points="3 6 5 6 21 6" /><path d="M19 6l-1 14H6L5 6" /><path d="M10 11v6M14 11v6" /><path d="M9 6V4h6v2" /></svg>
+        </button>
+      )
+    }),
   ], [updateLeg, removeLeg]);
 
   const greeksColumns = useMemo(() => [
-    columnHelper.display({ id: 'position', header: () => <div style={{ width: 90, paddingLeft: 10, flexShrink: 0, display: 'flex', alignItems: 'center' }}><span style={{ fontSize: 11, color: '#9CA3AF', fontWeight: 700, letterSpacing: '0.04em', textTransform: 'uppercase' }}>Position</span></div>, cell: ({ row }) => { const leg = row.original; const isBuy = leg.action === 'B'; return <div style={{ display: 'flex', flexDirection: 'column', justifyContent: 'center', gap: 6, padding: '8px 10px', borderRight: '1px solid rgba(255,255,255,0.05)', flexShrink: 0, width: 90, background: 'rgba(0,0,0,0.12)' }}><div style={{ display: 'flex', alignItems: 'center', gap: 5 }}><div onClick={() => updateLeg(leg.id, { checked: !leg.checked })} style={{ width: 14, height: 14, borderRadius: 3, background: leg.checked ? 'rgba(129,140,248,0.2)' : 'rgba(255,255,255,0.04)', border: `1px solid ${leg.checked ? 'rgba(129,140,248,0.6)' : 'rgba(255,255,255,0.15)'}`, display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0, cursor: 'pointer' }}>{leg.checked && <svg width="9" height="9" viewBox="0 0 10 10" fill="none"><path d="M2 5l2.5 2.5L8 3" stroke="#818cf8" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" /></svg>}</div><div onClick={() => updateLeg(leg.id, { action: leg.action === 'B' ? 'S' : 'B' })} style={{ padding: '0px 6px', height: 18, borderRadius: 3, background: isBuy ? 'rgba(38,166,154,0.15)' : 'rgba(242,54,69,0.15)', border: `1px solid ${isBuy ? 'rgba(38,166,154,0.4)' : 'rgba(242,54,69,0.4)'}`, cursor: 'pointer', display: 'flex', alignItems: 'center' }}><span style={{ fontSize: 11, fontWeight: 800, color: isBuy ? '#26a69a' : '#f23645' }}>{leg.action}</span></div><span style={{ fontSize: 11, fontWeight: 800, color: leg.type === 'CE' ? '#facc15' : '#c084fc', letterSpacing: '0.02em' }}>{leg.type}</span></div><div style={{ display: 'flex', alignItems: 'center', gap: 6 }}><span style={{ fontSize: 13, fontWeight: 800, color: '#E2E8F0', fontFamily: 'monospace', lineHeight: 1 }}>{leg.strike}</span><div style={{ background: 'rgba(255,255,255,0.06)', border: '1px solid rgba(255,255,255,0.08)', borderRadius: 4, padding: '2px 5px', display: 'flex', alignItems: 'center', justifyContent: 'center' }}><span style={{ fontSize: 10, color: '#9CA3AF', fontWeight: 700, fontFamily: 'monospace', lineHeight: 1 }}>{leg.lots}x</span></div></div></div>; } }),
-    ...greekItems.map((gk, gi) => columnHelper.display({ id: gk.key, header: () => <div style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', gap: 3, padding: '2px 6px', alignItems: 'center' }}><div style={{ fontSize: 14, color: gk.color, fontWeight: 700, letterSpacing: '0.02em' }}>{gk.label}</div><div style={{ display: 'flex', width: '100%', justifyContent: 'space-between', padding: '0 2px' }}><span style={{ fontSize: 10, color: 'rgba(156,163,175,0.7)', fontWeight: 600, letterSpacing: '0.03em' }}>Entry</span><span style={{ fontSize: 10, color: `${gk.color}cc`, fontWeight: 700, letterSpacing: '0.03em' }}>Live</span></div></div>, cell: ({ row }) => { const leg = row.original; const curr = leg.currGreeks[gk.key]; const entry = leg.entryGreeks[gk.key]; const chg = curr - entry; const chgColor = chg > 0 ? '#26a69a' : chg < 0 ? '#f23645' : '#6B7280'; return <div style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', justifyContent: 'center', padding: '4px 6px', borderRight: gi < 4 ? '1px solid rgba(255,255,255,0.03)' : 'none', height: '100%', gap: 2 }}><div style={{ display: 'flex', width: '100%', justifyContent: 'space-between', alignItems: 'center' }}><span style={{ fontSize: 12, color: '#9CA3AF', fontFamily: 'monospace', fontWeight: 600 }}>{fmtG(entry, gk.dec)}</span><span style={{ fontSize: 14, fontWeight: 800, color: gk.color, fontFamily: 'monospace' }}>{fmtG(curr, gk.dec)}</span></div><div style={{ display: 'flex', justifyContent: 'center' }}><span style={{ fontSize: 11, fontWeight: 700, color: chgColor, fontFamily: 'monospace' }}>{entry !== 0 ? `${chg >= 0 ? '+' : ''}${parseFloat(chg.toFixed(gk.dec))}` : '—'}</span></div></div>; } })),
+    columnHelper.display({ id: 'position', header: () => <div style={{ width: 90, paddingLeft: 10, flexShrink: 0, display: 'flex', alignItems: 'center' }}><span style={{ fontSize: 12, color: '#9CA3AF', fontWeight: 700, letterSpacing: '0.04em', textTransform: 'uppercase', whiteSpace: 'nowrap' }}>Position</span></div>, cell: ({ row }) => { const leg = row.original; const isBuy = leg.action === 'B'; return <div style={{ display: 'flex', flexDirection: 'column', justifyContent: 'center', gap: 6, padding: '8px 10px', borderRight: '1px solid rgba(255,255,255,0.05)', flexShrink: 0, width: 90, background: 'rgba(0,0,0,0.12)' }}><div style={{ display: 'flex', alignItems: 'center', gap: 5 }}><div onClick={() => updateLeg(leg.id, { checked: !leg.checked })} style={{ width: 14, height: 14, borderRadius: 3, background: leg.checked ? 'rgba(129,140,248,0.2)' : 'rgba(255,255,255,0.04)', border: `1px solid ${leg.checked ? 'rgba(129,140,248,0.6)' : 'rgba(255,255,255,0.15)'}`, display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0, cursor: 'pointer' }}>{leg.checked && <svg width="9" height="9" viewBox="0 0 10 10" fill="none"><path d="M2 5l2.5 2.5L8 3" stroke="#818cf8" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" /></svg>}</div><div onClick={() => updateLeg(leg.id, { action: leg.action === 'B' ? 'S' : 'B' })} style={{ padding: '0px 6px', height: 18, borderRadius: 3, background: isBuy ? 'rgba(38,166,154,0.15)' : 'rgba(242,54,69,0.15)', border: `1px solid ${isBuy ? 'rgba(38,166,154,0.4)' : 'rgba(242,54,69,0.4)'}`, cursor: 'pointer', display: 'flex', alignItems: 'center' }}><span style={{ fontSize: 11, fontWeight: 800, color: isBuy ? '#26a69a' : '#f23645' }}>{leg.action}</span></div><span style={{ fontSize: 11, fontWeight: 800, color: leg.type === 'CE' ? '#facc15' : '#c084fc', letterSpacing: '0.02em' }}>{leg.type}</span></div><div style={{ display: 'flex', alignItems: 'center', gap: 6 }}><span style={{ fontSize: 13, fontWeight: 800, color: '#E2E8F0', fontFamily: 'monospace', lineHeight: 1 }}>{leg.strike}</span><div style={{ background: 'rgba(255,255,255,0.06)', border: '1px solid rgba(255,255,255,0.08)', borderRadius: 4, padding: '2px 5px', display: 'flex', alignItems: 'center', justifyContent: 'center' }}><span style={{ fontSize: 10, color: '#9CA3AF', fontWeight: 700, fontFamily: 'monospace', lineHeight: 1 }}>{leg.lots}x</span></div></div></div>; } }),
+    ...greekItems.map((gk, gi) => columnHelper.display({ id: gk.key, header: () => <div style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', gap: 2, padding: '0 6px', alignItems: 'center' }}><div style={{ display: 'flex', alignItems: 'baseline', gap: 4 }}><span style={{ fontSize: 13, color: gk.color, fontWeight: 800, letterSpacing: '0.02em' }}>{gk.label}</span><span style={{ fontSize: 11, color: '#9CA3AF', fontWeight: 600, letterSpacing: '0.04em', textTransform: 'uppercase', whiteSpace: 'nowrap' }}>{gk.name}</span></div><div style={{ display: 'flex', width: '100%', justifyContent: 'space-between', padding: '0 2px' }}><span style={{ fontSize: 10, color: 'rgba(156,163,175,0.5)', fontWeight: 600, letterSpacing: '0.03em' }}>Ent</span><span style={{ fontSize: 10, color: 'rgba(156,163,175,0.7)', fontWeight: 700, letterSpacing: '0.03em' }}>Live</span></div></div>, cell: ({ row }) => { const leg = row.original; const isIv = gk.key === 'iv'; const rawCurr = leg.currGreeks[gk.key]; const rawEntry = leg.entryGreeks[gk.key]; const curr = isIv ? rawCurr * 100 : rawCurr; const entry = isIv ? rawEntry * 100 : rawEntry; const chg = curr - entry; const chgColor = chg > 0 ? '#26a69a' : chg < 0 ? '#f23645' : '#6B7280'; return <div style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', justifyContent: 'center', padding: '4px 6px', borderRight: gi < 4 ? '1px solid rgba(255,255,255,0.12)' : 'none', height: '100%', gap: 2 }}><div style={{ display: 'flex', width: '100%', justifyContent: 'space-between', alignItems: 'center' }}><span style={{ fontSize: 12, color: '#9CA3AF', fontFamily: 'monospace', fontWeight: 600 }}>{fmtG(entry, gk.dec)}{isIv ? '%' : ''}</span><span style={{ fontSize: 14, fontWeight: 800, color: gk.color, fontFamily: 'monospace' }}>{fmtG(curr, gk.dec)}{isIv ? '%' : ''}</span></div><div style={{ display: 'flex', justifyContent: 'center' }}><span style={{ fontSize: 13, fontWeight: 700, color: chgColor, fontFamily: 'monospace' }}>{entry !== 0 ? `${chg >= 0 ? '+' : ''}${parseFloat(chg.toFixed(gk.dec))}${isIv ? '%' : ''}` : '—'}</span></div></div>; } })),
     columnHelper.display({ id: 'delete', header: () => <div style={{ width: 34, flexShrink: 0 }} />, cell: ({ row }) => <div style={{ display: 'flex', alignItems: 'center', padding: '0 6px', borderLeft: '1px solid rgba(255,255,255,0.03)', flexShrink: 0, height: '100%' }}><button onClick={() => removeLeg(row.original.id)} style={{ background: 'transparent', border: 'none', cursor: 'pointer', color: '#1f2937', display: 'flex', alignItems: 'center', padding: 2, borderRadius: 4 }} onMouseEnter={e => (e.currentTarget.style.color = '#f23645')} onMouseLeave={e => (e.currentTarget.style.color = '#1f2937')}><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><polyline points="3 6 5 6 21 6" /><path d="M19 6l-1 14H6L5 6" /><path d="M10 11v6M14 11v6" /><path d="M9 6V4h6v2" /></svg></button></div> })
   ], [updateLeg, removeLeg]);
 
@@ -611,7 +760,7 @@ function MtmLayout({ visible, workerRef, workerReady, workerModeRef, mtmResultsC
                   const list = filterByTab(mtmResults.filter(i => i.instrument_type === 'EQ' || i.instrument_type === 'INDEX' || i.instrument_type === 'FUT'), mtmTab);
                   if (e.key === 'ArrowDown') { e.preventDefault(); setMtmCursor(c => Math.min(c + 1, list.length - 1)); mtmListRef.current?.children[mtmCursor + 1]?.scrollIntoView({ block: 'nearest' }); }
                   else if (e.key === 'ArrowUp') { e.preventDefault(); setMtmCursor(c => Math.max(c - 1, 0)); mtmListRef.current?.children[mtmCursor - 1]?.scrollIntoView({ block: 'nearest' }); }
-                  else if (e.key === 'Enter' && list.length > 0) { const sel = list[mtmCursor]; setMtmQuery(sel.trading_symbol); setShowMtmDropdown(false); setOcSymbol(sel.underlying_symbol || sel.trading_symbol); setOcAssetType(sel.instrument_type === 'INDEX' ? 'INDEX_FO' : 'STOCK_FO'); setOcExchange(sel.exchange ?? 'NSE'); }
+                  else if (e.key === 'Enter' && list.length > 0) { const sel = list[mtmCursor]; setMtmQuery(sel.trading_symbol); setShowMtmDropdown(false); setOcSymbol(sel.underlying_symbol || sel.trading_symbol); setOcAssetType(sel.instrument_type === 'INDEX' ? 'INDEX_FO' : 'STOCK_FO'); setOcExchange(sel.exchange ?? 'NSE'); setOcOpen(true); }
                   else if (e.key === 'Escape') { setShowMtmDropdown(false); }
                 }}
                 placeholder="Search instruments..."
@@ -635,7 +784,7 @@ function MtmLayout({ visible, workerRef, workerReady, workerModeRef, mtmResultsC
                     <div style={{ padding: '24px 16px', textAlign: 'center', fontSize: 12, color: '#3D4150' }}>No results for "{mtmQuery}"</div>
                   ) : filterByTab(mtmResults.filter(i => i.instrument_type === 'EQ' || i.instrument_type === 'INDEX' || i.instrument_type === 'FUT'), mtmTab).map((ins, i) => (
                     <div key={ins.instrument_key}
-                      onClick={() => { setMtmQuery(ins.trading_symbol); setShowMtmDropdown(false); setOcSymbol(ins.underlying_symbol || ins.trading_symbol); setOcAssetType(ins.instrument_type === 'INDEX' ? 'INDEX_FO' : 'STOCK_FO'); setOcExchange(ins.exchange ?? 'NSE'); }}
+                      onClick={() => { setMtmQuery(ins.trading_symbol); setShowMtmDropdown(false); setOcSymbol(ins.underlying_symbol || ins.trading_symbol); setOcAssetType(ins.instrument_type === 'INDEX' ? 'INDEX_FO' : 'STOCK_FO'); setOcExchange(ins.exchange ?? 'NSE'); setOcOpen(true); }}
                       onMouseEnter={() => setMtmCursor(i)}
                       style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '9px 14px', cursor: 'pointer', borderBottom: '1px solid rgba(255,255,255,0.03)', background: i === mtmCursor ? 'rgba(79,142,247,0.10)' : 'transparent', transition: 'background 0.08s' }}
                     >
@@ -689,22 +838,41 @@ function MtmLayout({ visible, workerRef, workerReady, workerModeRef, mtmResultsC
           </div>
         )}
         {/* Separator */}
-        <div style={{ height: 1, background: 'rgba(255,255,255,0.04)', margin: '0 14px 10px 14px' }} />
+        <div style={{ height: 1, background: 'rgba(255,255,255,0.04)', margin: '0 14px 10px 4px' }} />
         {/* Leg rows table */}
-        <div style={{ flex: 1, padding: '0 14px 14px 14px', overflowX: 'auto', overflowY: 'auto', scrollbarWidth: 'thin', scrollbarColor: '#2a2a2a transparent' }}>
-          <div style={{ minWidth: 640, display: 'flex', flexDirection: 'column', gap: 6 }}>
-            {/* Shared column header row - Rendered once at the top for all groups */}
-            <div style={{ display: 'flex', alignItems: 'center', gap: showGreeks ? 0 : 6, padding: showGreeks ? '2px 11px' : '0 10px', minWidth: showGreeks ? 'fit-content' : 'auto' }}>
-              {headerTable.getHeaderGroups().map(hg => (
-                <React.Fragment key={hg.id}>
-                  {hg.headers.map(h => (
-                    <React.Fragment key={h.id}>
-                      {flexRender(h.column.columnDef.header, h.getContext())}
-                    </React.Fragment>
+        <div style={{ flex: 1, padding: '0 10px 14px 10px', overflowX: 'auto', overflowY: 'auto', scrollbarWidth: 'thin', scrollbarColor: '#2a2a2a transparent' }}>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+            {/* Shared column header row */}
+            {showGreeks ? (
+              <div style={{ background: '#333333', borderRadius: 6, display: 'flex', alignItems: 'center', gap: 0, padding: '8px 11px' }}>
+                {headerTable.getHeaderGroups().map(hg => (
+                  <React.Fragment key={hg.id}>
+                    {hg.headers.map(h => (
+                      <React.Fragment key={h.id}>{flexRender(h.column.columnDef.header, h.getContext())}</React.Fragment>
+                    ))}
+                  </React.Fragment>
+                ))}
+              </div>
+            ) : (
+              <table style={{ width: '100%', borderCollapse: 'collapse', tableLayout: 'fixed' }}>
+                <colgroup>
+                  {headerTable.getAllColumns().map(col => (
+                    <col key={col.id} style={{ width: col.getSize() }} />
                   ))}
-                </React.Fragment>
-              ))}
-            </div>
+                </colgroup>
+                <thead>
+                  {headerTable.getHeaderGroups().map(hg => (
+                    <tr key={hg.id} style={{ background: '#333333', borderRadius: 6 }}>
+                      {hg.headers.map(h => (
+                        <th key={h.id} style={{ padding: '8px 6px', textAlign: 'left', fontWeight: 700, fontSize: 11, color: '#9CA3AF', letterSpacing: '0.04em', textTransform: 'uppercase', whiteSpace: 'nowrap' }}>
+                          {flexRender(h.column.columnDef.header, h.getContext())}
+                        </th>
+                      ))}
+                    </tr>
+                  ))}
+                </thead>
+              </table>
+            )}
             {legs.length === 0 && (
               <div style={{ padding: '24px', textAlign: 'center', color: '#3D4150', fontSize: 13 }}>
                 No legs yet — click B or S on the option chain to add
@@ -722,6 +890,54 @@ function MtmLayout({ visible, workerRef, workerReady, workerModeRef, mtmResultsC
                 <MtmGroupTable key={group.symbol} group={group} showGreeks={showGreeks} columns={showGreeks ? greeksColumns : stdColumns} />
               ));
             })()}
+
+            {/* Add Legs button */}
+            {ocSymbol && (
+              <div style={{ padding: '8px 10px 4px' }}>
+                <button
+                  onClick={() => setOcOpen(true)}
+                  style={{
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                    gap: 7,
+                    padding: '7px 20px',
+                    background: 'linear-gradient(135deg, #3b82f6 0%, #2563eb 100%)',
+                    border: 'none',
+                    borderRadius: 7,
+                    color: '#ffffff',
+                    fontSize: 12,
+                    fontWeight: 600,
+                    letterSpacing: '0.03em',
+                    cursor: 'pointer',
+                    transition: 'opacity 0.15s, transform 0.1s',
+                    width: 'fit-content',
+                    boxShadow: '0 2px 8px rgba(37,99,235,0.35)',
+                  }}
+                  onMouseEnter={e => {
+                    (e.currentTarget as HTMLButtonElement).style.opacity = '0.88';
+                    (e.currentTarget as HTMLButtonElement).style.transform = 'translateY(-1px)';
+                  }}
+                  onMouseLeave={e => {
+                    (e.currentTarget as HTMLButtonElement).style.opacity = '1';
+                    (e.currentTarget as HTMLButtonElement).style.transform = 'translateY(0)';
+                  }}
+                  onMouseDown={e => {
+                    (e.currentTarget as HTMLButtonElement).style.transform = 'translateY(0)';
+                    (e.currentTarget as HTMLButtonElement).style.opacity = '0.75';
+                  }}
+                  onMouseUp={e => {
+                    (e.currentTarget as HTMLButtonElement).style.opacity = '0.88';
+                    (e.currentTarget as HTMLButtonElement).style.transform = 'translateY(-1px)';
+                  }}
+                >
+                  <svg width="11" height="11" viewBox="0 0 11 11" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round">
+                    <path d="M5.5 1v9M1 5.5h9" />
+                  </svg>
+                  Add Legs
+                </button>
+              </div>
+            )}
           </div>
         </div>
 
