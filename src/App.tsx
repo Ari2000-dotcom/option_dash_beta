@@ -411,7 +411,8 @@ function MtmTheme2Table({ legs, updateLeg, removeLeg, showGreeks }: { legs: Leg[
             const leg = row.original;
             const sign = leg.action === 'S' ? -1 : 1;
             const isIv = gk.key === 'iv';
-            const val = isIv ? leg.entryGreeks[gk.key] * 100 : sign * leg.entryGreeks[gk.key];
+            const ivScale = isIv && !leg.instrumentKey ? 100 : 1;
+            const val = isIv ? leg.entryGreeks[gk.key] * ivScale : sign * leg.entryGreeks[gk.key];
             return <span style={{ fontSize: 13, fontWeight: 600, color: '#9CA3AF' }}>{fmtG(val, gk.dec)}{isIv ? '%' : ''}</span>;
           },
         }),
@@ -422,7 +423,8 @@ function MtmTheme2Table({ legs, updateLeg, removeLeg, showGreeks }: { legs: Leg[
             const leg = row.original;
             const sign = leg.action === 'S' ? -1 : 1;
             const isIv = gk.key === 'iv';
-            const val = isIv ? leg.currGreeks[gk.key] * 100 : sign * leg.currGreeks[gk.key];
+            const ivScale = isIv && !leg.instrumentKey ? 100 : 1;
+            const val = isIv ? leg.currGreeks[gk.key] * ivScale : sign * leg.currGreeks[gk.key];
             return <span style={{ fontSize: 14, fontWeight: 800, color: gk.color }}>{fmtG(val, gk.dec)}{isIv ? '%' : ''}</span>;
           },
         }),
@@ -433,8 +435,9 @@ function MtmTheme2Table({ legs, updateLeg, removeLeg, showGreeks }: { legs: Leg[
             const leg = row.original;
             const sign = leg.action === 'S' ? -1 : 1;
             const isIv = gk.key === 'iv';
-            const curr  = isIv ? leg.currGreeks[gk.key] * 100  : sign * leg.currGreeks[gk.key];
-            const entry = isIv ? leg.entryGreeks[gk.key] * 100 : sign * leg.entryGreeks[gk.key];
+            const ivScale = isIv && !leg.instrumentKey ? 100 : 1;
+            const curr  = isIv ? leg.currGreeks[gk.key] * ivScale  : sign * leg.currGreeks[gk.key];
+            const entry = isIv ? leg.entryGreeks[gk.key] * ivScale : sign * leg.entryGreeks[gk.key];
             const chg = curr - entry;
             const col = chg > 0 ? '#26a69a' : chg < 0 ? '#f23645' : '#6B7280';
             const sfx = isIv ? '%' : '';
@@ -674,17 +677,18 @@ function MtmTheme2Table({ legs, updateLeg, removeLeg, showGreeks }: { legs: Leg[
                               return (
                                 <td key={cell.id} style={{
                                   ...stickyTdStyle(id, rowBg),
-                                  padding: '5px 8px',
+                                  padding: '3px 6px',
                                   borderBottom: '1px solid rgba(255,255,255,0.07)',
-                                  fontSize: 14, verticalAlign: 'middle',
+                                  fontSize: 13, verticalAlign: 'middle',
                                 }}>
                                   {flexRender(cell.column.columnDef.cell, cell.getContext())}
                                 </td>
                               );
                             }
+                            const isGreek = cell.column.id.startsWith('greek_');
                             return (
                               <td key={cell.id} style={{
-                                padding: '9px 10px',
+                                padding: isGreek ? '9px 10px' : '4px 8px',
                                 borderBottom: '1px solid rgba(255,255,255,0.07)',
                                 borderLeft: needsCellBorder ? '2px solid rgba(255,255,255,0.18)' : '1px solid rgba(255,255,255,0.05)',
                                 verticalAlign: 'middle', fontSize: 14,
@@ -956,16 +960,22 @@ function MtmLayout({ visible, workerRef, workerReady, workerModeRef, mtmResultsC
       if (!leg.instrumentKey) return leg;
       const snap = wsManager.get(leg.instrumentKey);
       if (!snap?.ltp) return leg;
-      return { ...leg, currLtp: snap.ltp };
+      const newGreeks = { delta: snap.delta ?? 0, theta: snap.theta ?? 0, vega: snap.vega ?? 0, gamma: snap.gamma ?? 0, iv: snap.iv ?? 0 };
+      const entryGreeks = leg.entryGreeks.delta === 0 && newGreeks.delta !== 0 ? newGreeks : leg.entryGreeks;
+      return { ...leg, currLtp: snap.ltp, currGreeks: newGreeks, entryGreeks };
     }));
     const unsubs = mcxLegs.map(leg =>
       wsManager.subscribe(leg.instrumentKey!, md => {
         if (!md.ltp) return;
         setLegs(prev => {
           const idx = prev.findIndex(l => l.id === leg.id);
-          if (idx === -1 || prev[idx].currLtp === md.ltp) return prev;
+          if (idx === -1) return prev;
+          const cur = prev[idx];
+          const newGreeks = { delta: md.delta ?? cur.currGreeks.delta, theta: md.theta ?? cur.currGreeks.theta, vega: md.vega ?? cur.currGreeks.vega, gamma: md.gamma ?? cur.currGreeks.gamma, iv: md.iv ?? cur.currGreeks.iv };
+          const entryGreeks = cur.entryGreeks.delta === 0 && newGreeks.delta !== 0 ? newGreeks : cur.entryGreeks;
+          if (cur.currLtp === md.ltp && cur.currGreeks.delta === newGreeks.delta) return prev;
           const next = [...prev];
-          next[idx] = { ...next[idx], currLtp: md.ltp };
+          next[idx] = { ...cur, currLtp: md.ltp, currGreeks: newGreeks, entryGreeks };
           return next;
         });
       })
