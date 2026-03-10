@@ -12,6 +12,8 @@ export default defineConfig({
     },
   },
   server: {
+    port: 8000,
+    strictPort: true,
     watch: {
       // Ignore the server token cache so Vite doesn't reload when it's written during auto-login
       ignored: ['**/server/upstox_token.json', '**/server/nubra_device.json'],

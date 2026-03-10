@@ -3,6 +3,7 @@ import { useInstruments, type Instrument } from './useInstruments';
 import { loadNubraInstruments } from './db';
 import type { NubraInstrument } from './useNubraInstruments';
 import OptionChain from './OptionChain';
+import BasketOrder, { type BasketLeg, DomSidePanel } from './BasketOrder';
 import StrategyChart from './StrategyChart';
 import LoadingScreen from './LoadingScreen';
 import StraddleChart from './StraddleChart';
@@ -229,6 +230,7 @@ interface Greeks { delta: number; theta: number; vega: number; gamma: number; iv
 interface Leg {
   id: number;
   refId?: number;
+  instrumentKey?: string; // Upstox instrument_key — used for MCX live LTP via wsManager
   symbol: string;
   expiry: string;
   strike: number;
@@ -239,6 +241,7 @@ interface Leg {
   price: number;       // entry LTP
   entrySpot: number;   // spot at time of entry
   entryTime: string;   // HH:MM:SS at time of entry
+  entryDate: string;   // YYYY-MM-DD date of entry
   currLtp: number;     // live LTP (updated from OC feed)
   checked: boolean;    // include in MTM total
   entryGreeks: Greeks; // greeks at entry
@@ -251,12 +254,21 @@ const fmtG = (v: number, dec = 4) => v === 0 ? '—' : Math.abs(v) < 0.0001 ? v.
 const fmtMtm = (v: number): string => {
   const abs = Math.abs(v);
   const sign = v >= 0 ? '+' : '-';
-  if (abs >= 1_00_00_000) return `${sign}₹${(abs / 1_00_00_000).toFixed(2)}Cr`;
-  if (abs >= 1_00_000)    return `${sign}₹${(abs / 1_00_000).toFixed(2)}L`;
-  if (abs >= 1_000)       return `${sign}₹${(abs / 1_000).toFixed(2)}K`;
+  if (abs >= 1_00_00_00_00_000) return `${sign}₹${(abs / 1_00_00_00_00_000).toFixed(2)}LCr`;
+  if (abs >= 1_00_00_00_000)    return `${sign}₹${(abs / 1_00_00_00_000).toFixed(2)}KCr`;
+  if (abs >= 1_00_00_000)       return `${sign}₹${(abs / 1_00_00_000).toFixed(2)}Cr`;
+  if (abs >= 1_00_000)          return `${sign}₹${(abs / 1_00_000).toFixed(2)}L`;
+  if (abs >= 1_000)             return `${sign}₹${(abs / 1_000).toFixed(2)}K`;
   return `${sign}₹${abs.toFixed(2)}`;
 };
-const fmtExpiry = (e: string) => new Date(`${e.slice(0, 4)}-${e.slice(4, 6)}-${e.slice(6, 8)}T00:00:00Z`).toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: '2-digit', timeZone: 'UTC' });
+const fmtExpiry = (e: string) => {
+  if (e.length > 8) {
+    // MCX: Unix ms timestamp string
+    return new Date(Number(e)).toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: '2-digit' });
+  }
+  // Nubra: YYYYMMDD
+  return new Date(`${e.slice(0, 4)}-${e.slice(4, 6)}-${e.slice(6, 8)}T00:00:00Z`).toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: '2-digit', timeZone: 'UTC' });
+};
 const greekItems: { key: keyof Greeks; label: string; name: string; color: string; dec: number }[] = [
   { key: 'delta', label: 'Δ', name: 'Delta', color: '#60a5fa', dec: 4 },
   { key: 'theta', label: 'Θ', name: 'Theta', color: '#f59e0b', dec: 2 },
@@ -264,6 +276,441 @@ const greekItems: { key: keyof Greeks; label: string; name: string; color: strin
   { key: 'iv',    label: 'IV', name: 'IV',    color: '#34d399', dec: 2 },
   { key: 'gamma', label: 'Γ', name: 'Gamma', color: '#fb923c', dec: 5 },
 ];
+
+// ── Theme 2: full flat TanStack table ─────────────────────────────────────────
+const t2ColHelper = createColumnHelper<Leg>();
+
+
+function MtmTheme2Table({ legs, updateLeg, removeLeg, showGreeks }: { legs: Leg[]; updateLeg: (id: number, patch: Partial<Leg>) => void; removeLeg: (id: number) => void; showGreeks: boolean }) {
+  const allDefinedColumns = useMemo(() => [
+    t2ColHelper.display({
+      id: 'symbol', size: 80,
+      header: () => <span style={{ fontSize: 12, color: '#9CA3AF', fontWeight: 700, textTransform: 'capitalize', letterSpacing: '0.03em' }}>Symbol</span>,
+      cell: ({ row }) => {
+        const leg = row.original;
+        const symbolColors: Record<string, string> = { NIFTY: '#60a5fa', BANKNIFTY: '#a78bfa', FINNIFTY: '#34d399', SENSEX: '#fb923c' };
+        const col = symbolColors[leg.symbol] ?? '#9CA3AF';
+        return <span style={{ fontSize: 14, fontWeight: 800, color: col, letterSpacing: '0.02em' }}>{leg.symbol}</span>;
+      },
+    }),
+    t2ColHelper.display({
+      id: 'expiry', size: 76,
+      header: () => <span style={{ fontSize: 12, color: '#9CA3AF', fontWeight: 700, textTransform: 'capitalize', letterSpacing: '0.03em' }}>Expiry</span>,
+      cell: ({ row }) => <span style={{ fontSize: 13, color: '#C0C7D4', fontWeight: 500 }}>{fmtExpiry(row.original.expiry)}</span>,
+    }),
+    t2ColHelper.display({
+      id: 'strike', size: 64,
+      header: () => <span style={{ fontSize: 12, color: '#9CA3AF', fontWeight: 700, textTransform: 'capitalize', letterSpacing: '0.03em' }}>Strike</span>,
+      cell: ({ row }) => <span style={{ fontSize: 14, fontWeight: 700, color: '#60a5fa', fontFamily: '-apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif' }}>{row.original.strike}</span>,
+    }),
+    t2ColHelper.display({
+      id: 'type', size: 44,
+      header: () => <span style={{ fontSize: 12, color: '#9CA3AF', fontWeight: 700, textTransform: 'capitalize', letterSpacing: '0.03em' }}>Type</span>,
+      cell: ({ row }) => {
+        const leg = row.original;
+        return <span style={{ fontSize: 13, fontWeight: 700, color: leg.type === 'CE' ? '#26a69a' : '#f23645', background: leg.type === 'CE' ? 'rgba(38,166,154,0.1)' : 'rgba(242,54,69,0.1)', padding: '2px 6px', borderRadius: 4 }}>{leg.type}</span>;
+      },
+    }),
+    // ── Buy columns ──────────────────────────────────────────────────────────
+    t2ColHelper.display({
+      id: 'buy_action', size: 52,
+      header: () => <span style={{ fontSize: 12, color: '#26a69a', fontWeight: 700, textTransform: 'capitalize', letterSpacing: '0.03em' }}>Side</span>,
+      cell: ({ row }) => {
+        const leg = row.original; const isBuy = leg.action === 'B';
+        return (
+          <div onClick={() => updateLeg(leg.id, { action: isBuy ? 'S' : 'B' })}
+            style={{ display: 'inline-flex', alignItems: 'center', gap: 4, padding: '2px 10px', borderRadius: 4, background: isBuy ? 'rgba(38,166,154,0.15)' : 'rgba(242,54,69,0.15)', border: `1px solid ${isBuy ? 'rgba(38,166,154,0.5)' : 'rgba(242,54,69,0.5)'}`, cursor: 'pointer' }}>
+            <span style={{ fontSize: 13, fontWeight: 800, color: isBuy ? '#26a69a' : '#f23645' }}>{isBuy ? 'Buy' : 'Sell'}</span>
+          </div>
+        );
+      },
+    }),
+    t2ColHelper.display({
+      id: 'lots', size: 80,
+      header: () => <span style={{ fontSize: 12, color: '#9CA3AF', fontWeight: 700, textTransform: 'capitalize', letterSpacing: '0.03em' }}>Lots</span>,
+      cell: ({ row }) => (
+        <input
+          type="number"
+          min={1}
+          value={row.original.lots}
+          onChange={e => { const v = parseInt(e.target.value); if (!isNaN(v) && v >= 1) updateLeg(row.original.id, { lots: v }); }}
+          style={{ width: '100%', background: 'rgba(255,255,255,0.04)', border: '1px solid rgba(255,255,255,0.12)', borderRadius: 4, height: 24, textAlign: 'center', fontSize: 13, fontWeight: 700, color: '#E2E8F0', fontFamily: '-apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif', outline: 'none', padding: '0 4px', MozAppearance: 'textfield' } as React.CSSProperties}
+        />
+      ),
+    }),
+    t2ColHelper.display({
+      id: 'price', size: 72,
+      header: () => <span style={{ fontSize: 12, color: '#9CA3AF', fontWeight: 700, textTransform: 'capitalize', letterSpacing: '0.03em' }}>Price</span>,
+      cell: ({ row }) => <span style={{ fontSize: 15, fontWeight: 600, color: '#D1D4DC', fontFamily: '-apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif' }}>₹{row.original.price.toFixed(2)}</span>,
+    }),
+    t2ColHelper.display({
+      id: 'ltp', size: 72,
+      header: () => <span style={{ fontSize: 12, color: '#9CA3AF', fontWeight: 700, textTransform: 'capitalize', letterSpacing: '0.03em' }}>LTP</span>,
+      cell: ({ row }) => {
+        const ltp = row.original.currLtp > 0 ? row.original.currLtp : row.original.price;
+        const diff = ltp - row.original.price;
+        const col = diff > 0 ? '#26a69a' : diff < 0 ? '#f23645' : '#E2E8F0';
+        return <span style={{ fontSize: 15, fontWeight: 700, color: col, fontFamily: '-apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif' }}>₹{ltp.toFixed(2)}</span>;
+      },
+    }),
+    t2ColHelper.display({
+      id: 'spot', size: 72,
+      header: () => <span style={{ fontSize: 12, color: '#e0a800', fontWeight: 700, textTransform: 'capitalize', letterSpacing: '0.03em' }}>E.Spot</span>,
+      cell: ({ row }) => <span style={{ fontSize: 13, fontWeight: 600, color: '#e0a800', fontFamily: '-apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif' }}>{row.original.entrySpot > 0 ? row.original.entrySpot.toFixed(2) : '—'}</span>,
+    }),
+    t2ColHelper.display({
+      id: 'time', size: 68,
+      header: () => <span style={{ fontSize: 12, color: '#a78bfa', fontWeight: 700, textTransform: 'capitalize', letterSpacing: '0.03em' }}>E.Time</span>,
+      cell: ({ row }) => <span style={{ fontSize: 13, fontWeight: 500, color: '#a78bfa' }}>{row.original.entryTime}</span>,
+    }),
+    t2ColHelper.display({
+      id: 'entry_date', size: 84,
+      header: () => <span style={{ fontSize: 12, color: '#a78bfa', fontWeight: 700, textTransform: 'capitalize', letterSpacing: '0.03em' }}>E.Date</span>,
+      cell: ({ row }) => {
+        const d = row.original.entryDate;
+        if (!d) return <span style={{ fontSize: 13, fontWeight: 500, color: '#a78bfa' }}>—</span>;
+        const dt = new Date(`${d}T00:00:00Z`);
+        const fmt = dt.toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric', timeZone: 'UTC' });
+        return <span style={{ fontSize: 13, fontWeight: 500, color: '#a78bfa' }}>{fmt}</span>;
+      },
+    }),
+    t2ColHelper.display({
+      id: 'mtm', size: 96,
+      header: () => <span style={{ fontSize: 12, color: '#9CA3AF', fontWeight: 700, textTransform: 'capitalize', letterSpacing: '0.03em' }}>MTM</span>,
+      cell: ({ row }) => {
+        const leg = row.original;
+        const currLtp = leg.currLtp > 0 ? leg.currLtp : leg.price;
+        const mtm = (leg.action === 'B' ? currLtp - leg.price : leg.price - currLtp) * leg.lots * (leg.lotSize || 1);
+        const pos = mtm >= 0;
+        const fmt = fmtMtm(mtm);
+        return (
+          <div style={{ display: 'flex', alignItems: 'center', gap: 0, whiteSpace: 'nowrap' }}>
+            <span style={{ fontSize: 14, fontWeight: 800, color: pos ? '#26a69a' : '#f23645', fontFamily: '-apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif', lineHeight: 1, whiteSpace: 'nowrap' }}>{fmt}</span>
+          </div>
+        );
+      },
+    }),
+    // ── Greeks: 3 columns per greek (Entry | Live | Chg) ────────────────────
+    ...greekItems.flatMap((gk, gi) => {
+      const isLast = gi === greekItems.length - 1;
+      const groupBorder = !isLast ? '2px solid rgba(255,255,255,0.10)' : 'none';
+      const hdr = (label: string) => (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 1, alignItems: 'center' }}>
+          <div style={{ display: 'flex', alignItems: 'baseline', gap: 3 }}>
+            <span style={{ fontSize: 13, color: gk.color, fontWeight: 800 }}>{gk.label}</span>
+            <span style={{ fontSize: 11, color: '#D1D5DB', fontWeight: 600, textTransform: 'capitalize', letterSpacing: '0.03em', whiteSpace: 'nowrap' }}>{gk.name}</span>
+          </div>
+          <span style={{ fontSize: 11, color: 'rgba(209,213,219,0.7)', fontWeight: 700, letterSpacing: '0.03em', textTransform: 'capitalize' }}>{label}</span>
+        </div>
+      );
+      return [
+        t2ColHelper.display({
+          id: `greek_${gk.key}_entry`, size: 60,
+          header: () => hdr('Entry'),
+          cell: ({ row }) => {
+            const leg = row.original;
+            const sign = leg.action === 'S' ? -1 : 1;
+            const isIv = gk.key === 'iv';
+            const val = isIv ? leg.entryGreeks[gk.key] * 100 : sign * leg.entryGreeks[gk.key];
+            return <span style={{ fontSize: 13, fontWeight: 600, color: '#9CA3AF' }}>{fmtG(val, gk.dec)}{isIv ? '%' : ''}</span>;
+          },
+        }),
+        t2ColHelper.display({
+          id: `greek_${gk.key}_live`, size: 60,
+          header: () => hdr('Live'),
+          cell: ({ row }) => {
+            const leg = row.original;
+            const sign = leg.action === 'S' ? -1 : 1;
+            const isIv = gk.key === 'iv';
+            const val = isIv ? leg.currGreeks[gk.key] * 100 : sign * leg.currGreeks[gk.key];
+            return <span style={{ fontSize: 14, fontWeight: 800, color: gk.color }}>{fmtG(val, gk.dec)}{isIv ? '%' : ''}</span>;
+          },
+        }),
+        t2ColHelper.display({
+          id: `greek_${gk.key}_chg`, size: 56,
+          header: () => hdr('Chg'),
+          cell: ({ row }) => {
+            const leg = row.original;
+            const sign = leg.action === 'S' ? -1 : 1;
+            const isIv = gk.key === 'iv';
+            const curr  = isIv ? leg.currGreeks[gk.key] * 100  : sign * leg.currGreeks[gk.key];
+            const entry = isIv ? leg.entryGreeks[gk.key] * 100 : sign * leg.entryGreeks[gk.key];
+            const chg = curr - entry;
+            const col = chg > 0 ? '#26a69a' : chg < 0 ? '#f23645' : '#6B7280';
+            const sfx = isIv ? '%' : '';
+            return (
+              <span style={{ fontSize: 13, fontWeight: 700, color: col, borderRight: groupBorder, paddingRight: !isLast ? 6 : 0, display: 'block' }}>
+                {entry !== 0 ? `${chg >= 0 ? '+' : ''}${parseFloat(chg.toFixed(gk.dec))}${sfx}` : '—'}
+              </span>
+            );
+          },
+        }),
+      ];
+    }),
+    t2ColHelper.display({
+      id: 'delete', size: 30,
+      header: () => <span />,
+      cell: ({ row }) => (
+        <button onClick={() => removeLeg(row.original.id)}
+          style={{ background: 'transparent', border: 'none', cursor: 'pointer', color: '#4B5563', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 3, borderRadius: 4, margin: 'auto' }}
+          onMouseEnter={e => (e.currentTarget.style.color = '#f23645')}
+          onMouseLeave={e => (e.currentTarget.style.color = '#4B5563')}>
+          <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><polyline points="3 6 5 6 21 6" /><path d="M19 6l-1 14H6L5 6" /><path d="M10 11v6M14 11v6" /><path d="M9 6V4h6v2" /></svg>
+        </button>
+      ),
+    }),
+  ], [updateLeg, removeLeg]);
+
+  // Greeks mode: show only check + symbol/expiry/strike/type + greeks + delete
+  // Normal mode: show everything except greek_ columns
+  const GREEK_VISIBLE_IDS = new Set(['symbol', 'expiry', 'strike', 'type', 'delete']);
+  const columns = useMemo(
+    () => allDefinedColumns.filter(c => {
+      const id = (c as any).id as string;
+      if (showGreeks) return GREEK_VISIBLE_IDS.has(id) || id.startsWith('greek_');
+      return !id.startsWith('greek_');
+    }),
+    [allDefinedColumns, showGreeks]
+  );
+
+  const table = useReactTable({ data: legs, columns, getCoreRowModel: getCoreRowModel() });
+
+  const totalMtm = legs.filter(l => l.checked).reduce((sum, leg) => {
+    const currLtp = leg.currLtp > 0 ? leg.currLtp : leg.price;
+    return sum + (leg.action === 'B' ? currLtp - leg.price : leg.price - currLtp) * leg.lots * (leg.lotSize || 1);
+  }, 0);
+  const totalColor = totalMtm >= 0 ? '#26a69a' : '#f23645';
+
+  const allCols    = table.getAllColumns();
+  const detailCols = allCols.filter(c => ['buy_action','lots','price','ltp'].includes(c.id));
+  const pnlCols    = allCols.filter(c => ['spot','time','entry_date','mtm','delete'].includes(c.id));
+  const greekCols  = allCols.filter(c => c.id.startsWith('greek_'));
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', flex: 1, minHeight: 0 }}>
+      {/* Total MTM bar */}
+      {legs.length > 0 && (
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'flex-end', gap: 8, padding: '5px 14px', background: 'rgba(255,255,255,0.02)', borderBottom: '1px solid rgba(255,255,255,0.07)', flexShrink: 0 }}>
+          <span style={{ fontSize: 11, color: '#6B7280', fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.06em' }}>Total MTM</span>
+          <span style={{ fontSize: 15, fontWeight: 800, color: totalColor, fontFamily: '-apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif' }}>{fmtMtm(totalMtm)}</span>
+        </div>
+      )}
+      {/* sticky cols: check=30, symbol=80, expiry=76, strike=64, type=44 → cumulative lefts */}
+      <div style={{ flexShrink: 0, overflowX: 'auto', overflowY: 'visible', scrollbarWidth: 'thin', scrollbarColor: '#4F8EF7 #1a1a1a' }}>
+      {(() => {
+        const STICKY_IDS = ['symbol','expiry','strike','type'];
+        const STICKY_SIZES: Record<string,number> = { symbol:80, expiry:76, strike:64, type:44 };
+        // build cumulative left offsets
+        const stickyLeft: Record<string,number> = {};
+        let acc = 0;
+        for (const id of STICKY_IDS) { stickyLeft[id] = acc; acc += STICKY_SIZES[id]; }
+
+        const stickyThStyle = (id: string, bg: string, extraBorder?: string): React.CSSProperties => ({
+          position: 'sticky', left: stickyLeft[id], zIndex: 4,
+          background: bg, whiteSpace: 'nowrap',
+          boxShadow: id === 'type' ? '4px 0 8px rgba(0,0,0,0.35)' : undefined,
+          borderLeft: extraBorder ?? 'none',
+        });
+        const stickyTdStyle = (id: string, rowBg: string): React.CSSProperties => ({
+          position: 'sticky', left: stickyLeft[id], zIndex: 2,
+          background: rowBg,
+          boxShadow: id === 'type' ? '4px 0 8px rgba(0,0,0,0.35)' : undefined,
+        });
+
+        // compute sticky col count from visible cols
+        const visibleStickyIds = STICKY_IDS.filter(id => allCols.find(c => c.id === id));
+        const stickySpan = visibleStickyIds.length;
+        // compute exact pixel width of all sticky cols combined
+        const stickyTotalW = visibleStickyIds.reduce((s, id) => s + STICKY_SIZES[id], 0);
+
+        return (
+          <div style={{ display: 'contents' }}>
+            <table style={{ borderCollapse: 'collapse', tableLayout: 'fixed', width: 'max-content' }}>
+              <colgroup>
+                {allCols.map(col => (
+                  <col key={col.id} style={{ width: STICKY_IDS.includes(col.id) ? STICKY_SIZES[col.id] : col.getSize() }} />
+                ))}
+              </colgroup>
+              <thead style={{ position: 'sticky', top: 0, zIndex: 5 }}>
+                {/* ── Super-header row ── */}
+                <tr style={{ borderBottom: '1px solid rgba(255,255,255,0.06)' }}>
+                  {/* Position: sticky th spanning all sticky cols, width forced to exact pixel sum */}
+                  <th colSpan={stickySpan} style={{ position: 'sticky', left: 0, zIndex: 5, width: stickyTotalW, minWidth: stickyTotalW, textAlign: 'center', padding: '10px 0', fontSize: 13, fontWeight: 800, color: '#9CA3AF', letterSpacing: '0.08em', background: '#333333' }}>Position</th>
+                  {!showGreeks && <th colSpan={detailCols.length} style={{ textAlign: 'center', padding: '10px 0', fontSize: 13, fontWeight: 800, color: '#e0a800', background: '#333333', letterSpacing: '0.08em', whiteSpace: 'nowrap' }}>Buy / Sell</th>}
+                  {!showGreeks && <th colSpan={pnlCols.length} style={{ textAlign: 'center', padding: '10px 0', fontSize: 13, fontWeight: 800, color: '#818cf8', background: '#333333', letterSpacing: '0.08em', whiteSpace: 'nowrap' }}>P&L</th>}
+                  {greekCols.length > 0 && <th colSpan={greekCols.length} style={{ textAlign: 'center', padding: '10px 0', fontSize: 13, fontWeight: 800, color: '#34d399', background: '#333333', letterSpacing: '0.08em', whiteSpace: 'nowrap' }}>Greeks</th>}
+                </tr>
+                {/* ── Sub-header row ── */}
+                {table.getHeaderGroups().map(hg => (
+                  <tr key={hg.id} style={{ borderBottom: '2px solid rgba(255,255,255,0.12)' }}>
+                    {hg.headers.map(h => {
+                      const id = h.column.id;
+                      const isSticky = STICKY_IDS.includes(id);
+                      const sectionBg = '#333333';
+                      const isFirstDetail = id === 'buy_action';
+                      const isFirstEnd    = id === 'spot';
+                      const isGreekGroupStartH = id.endsWith('_entry') && id.startsWith('greek_');
+                      const needsLeftBorder = showGreeks ? isGreekGroupStartH : (isFirstDetail || isFirstEnd);
+                      const borderL = needsLeftBorder ? '2px solid rgba(255,255,255,0.18)' : 'none';
+                      if (isSticky) {
+                        return (
+                          <th key={h.id} style={{ ...stickyThStyle(id, '#333333', borderL), padding: '8px 8px', textAlign: 'left', fontSize: 13 }}>
+                            {flexRender(h.column.columnDef.header, h.getContext())}
+                          </th>
+                        );
+                      }
+                      return (
+                        <th key={h.id} style={{ padding: '8px 8px', textAlign: 'left', background: sectionBg, borderLeft: borderL, whiteSpace: 'nowrap', fontSize: 13 }}>
+                          {flexRender(h.column.columnDef.header, h.getContext())}
+                        </th>
+                      );
+                    })}
+                  </tr>
+                ))}
+              </thead>
+              <tbody>
+                {legs.length === 0 ? (
+                  <tr>
+                    <td colSpan={allCols.length} style={{ padding: '32px 16px', textAlign: 'center', color: '#3D4150', fontSize: 14 }}>
+                      No legs yet — click B or S on the option chain to add
+                    </td>
+                  </tr>
+                ) : (() => {
+                  const rows = table.getRowModel().rows;
+                  const symbolColors: Record<string, { accent: string }> = {
+                    NIFTY: { accent: '#60a5fa' }, BANKNIFTY: { accent: '#a78bfa' },
+                    FINNIFTY: { accent: '#34d399' }, SENSEX: { accent: '#fb923c' },
+                  };
+
+                  const renderNetRow = (symLegs: Leg[], key: string) => {
+                    const checked = symLegs.filter(l => l.checked);
+                    const totals: Record<string, { entry: number; live: number }> = {};
+                    greekItems.filter(g => g.key !== 'iv').forEach(g => {
+                      totals[g.key] = {
+                        entry: checked.reduce((s, l) => s + (l.action === 'S' ? -1 : 1) * l.entryGreeks[g.key], 0),
+                        live:  checked.reduce((s, l) => s + (l.action === 'S' ? -1 : 1) * l.currGreeks[g.key], 0),
+                      };
+                    });
+                    const bg = '#1e1e1e';
+                    const baseStyle: React.CSSProperties = { padding: '8px 10px', fontSize: 13, fontWeight: 700, verticalAlign: 'middle', whiteSpace: 'nowrap', borderTop: '1px solid rgba(255,255,255,0.1)' };
+                    return (
+                      <tr key={`net-${key}`} style={{ background: bg }}>
+                        {table.getVisibleLeafColumns().map(col => {
+                          const id = col.id;
+                          const isSticky = STICKY_IDS.includes(id);
+                          const isGreekGroupStart = id.endsWith('_entry') && id.startsWith('greek_');
+                          const borderL = isGreekGroupStart ? '2px solid rgba(255,255,255,0.18)' : '1px solid rgba(255,255,255,0.05)';
+                          if (isSticky) {
+                            const label = id === 'symbol' ? <span style={{ fontSize: 10, fontWeight: 700, color: '#6B7280', letterSpacing: '0.06em', textTransform: 'uppercase' }}>Net Σ</span> : null;
+                            return <td key={id} style={{ ...stickyTdStyle(id, bg), ...baseStyle }}>{label}</td>;
+                          }
+                          if (id.startsWith('greek_') && id.endsWith('_entry')) {
+                            const k = id.replace('greek_', '').replace('_entry', '') as keyof Greeks;
+                            if (k === 'iv') return <td key={id} style={{ ...baseStyle, borderLeft: borderL, background: bg, color: '#4B5563' }}>—</td>;
+                            const gk = greekItems.find(g => g.key === k)!;
+                            const v = totals[k]?.entry ?? 0;
+                            return <td key={id} style={{ ...baseStyle, borderLeft: borderL, background: bg, color: '#9CA3AF' }}>{fmtG(v, gk.dec)}</td>;
+                          }
+                          if (id.startsWith('greek_') && id.endsWith('_live')) {
+                            const k = id.replace('greek_', '').replace('_live', '') as keyof Greeks;
+                            if (k === 'iv') return <td key={id} style={{ ...baseStyle, background: bg, color: '#4B5563' }}>—</td>;
+                            const gk = greekItems.find(g => g.key === k)!;
+                            const v = totals[k]?.live ?? 0;
+                            return <td key={id} style={{ ...baseStyle, background: bg, color: gk.color }}>{fmtG(v, gk.dec)}</td>;
+                          }
+                          if (id.startsWith('greek_') && id.endsWith('_chg')) {
+                            const k = id.replace('greek_', '').replace('_chg', '') as keyof Greeks;
+                            if (k === 'iv') return <td key={id} style={{ ...baseStyle, background: bg, color: '#4B5563' }}>—</td>;
+                            const gk = greekItems.find(g => g.key === k)!;
+                            const chg = (totals[k]?.live ?? 0) - (totals[k]?.entry ?? 0);
+                            const chgColor = chg > 0 ? '#26a69a' : chg < 0 ? '#f23645' : '#6B7280';
+                            return <td key={id} style={{ ...baseStyle, background: bg, color: chgColor }}>{chg === 0 ? '—' : fmtG(chg, gk.dec)}</td>;
+                          }
+                          return <td key={id} style={{ ...baseStyle, background: bg }} />;
+                        })}
+                      </tr>
+                    );
+                  };
+
+                  const result: React.ReactNode[] = [];
+                  // group rows by symbol
+                  const groups: { sym: string; rows: typeof rows }[] = [];
+                  rows.forEach(row => {
+                    const sym = row.original.symbol;
+                    if (!groups.length || groups[groups.length - 1].sym !== sym) groups.push({ sym, rows: [] });
+                    groups[groups.length - 1].rows.push(row);
+                  });
+
+                  let rowIndex = 0;
+                  groups.forEach((grp, gi) => {
+                    const accent = symbolColors[grp.sym]?.accent ?? '#9CA3AF';
+                    result.push(
+                      <tr key={`grp-${grp.sym}-${gi}`} style={{ background: '#1a1a1a' }}>
+                        <td colSpan={allCols.length} style={{
+                          padding: '5px 10px',
+                          borderTop: gi > 0 ? '2px solid rgba(255,255,255,0.1)' : undefined,
+                          borderBottom: '1px solid rgba(255,255,255,0.06)',
+                        }}>
+                          <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                            <div style={{ width: 3, height: 14, borderRadius: 2, background: accent, flexShrink: 0 }} />
+                            <span style={{ fontSize: 11, fontWeight: 800, color: accent, letterSpacing: '0.08em', textTransform: 'uppercase' }}>{grp.sym}</span>
+                          </div>
+                        </td>
+                      </tr>
+                    );
+                    grp.rows.forEach(row => {
+                      const ri = rowIndex++;
+                      const rowBg = ri % 2 === 0 ? '#1c1c1c' : '#171717';
+                      result.push(
+                        <tr key={row.id} style={{ opacity: row.original.checked ? 1 : 0.38, transition: 'opacity 0.2s' }}>
+                          {row.getVisibleCells().map(cell => {
+                            const id = cell.column.id;
+                            const isSticky = STICKY_IDS.includes(id);
+                            const isFirstDetail = id === 'buy_action';
+                            const isFirstEnd    = id === 'spot';
+                            const isGreekGroupStart = id.endsWith('_entry') && id.startsWith('greek_');
+                            const needsCellBorder = showGreeks ? isGreekGroupStart : (isFirstDetail || isFirstEnd);
+                            if (isSticky) {
+                              return (
+                                <td key={cell.id} style={{
+                                  ...stickyTdStyle(id, rowBg),
+                                  padding: '5px 8px',
+                                  borderBottom: '1px solid rgba(255,255,255,0.07)',
+                                  fontSize: 14, verticalAlign: 'middle',
+                                }}>
+                                  {flexRender(cell.column.columnDef.cell, cell.getContext())}
+                                </td>
+                              );
+                            }
+                            return (
+                              <td key={cell.id} style={{
+                                padding: '9px 10px',
+                                borderBottom: '1px solid rgba(255,255,255,0.07)',
+                                borderLeft: needsCellBorder ? '2px solid rgba(255,255,255,0.18)' : '1px solid rgba(255,255,255,0.05)',
+                                verticalAlign: 'middle', fontSize: 14,
+                                background: rowBg,
+                              }}>
+                                {flexRender(cell.column.columnDef.cell, cell.getContext())}
+                              </td>
+                            );
+                          })}
+                        </tr>
+                      );
+                    });
+                    // net row per group (always shown, shows MTM in normal mode, greeks in greek mode)
+                    result.push(renderNetRow(grp.rows.map(r => r.original), `${grp.sym}-${gi}`));
+                  });
+                  return result;
+                })()}
+              </tbody>
+            </table>
+          </div>
+        );
+      })()}
+      </div>
+    </div>
+  );
+}
 
 function MtmGroupTable({ group, showGreeks, columns }: { group: { symbol: string; legs: Leg[] }, showGreeks: boolean, columns: any }) {
   const groupMtm = group.legs.filter(l => l.checked).reduce((sum, leg) => {
@@ -294,8 +741,8 @@ function MtmGroupTable({ group, showGreeks, columns }: { group: { symbol: string
         <span style={{ fontSize: 14, fontWeight: 800, color: sc.accent, letterSpacing: '0.04em' }}>{group.symbol}</span>
         <span style={{ fontSize: 12, color: '#6B7280', fontWeight: 500, paddingLeft: 4 }}>{group.legs.length} leg{group.legs.length > 1 ? 's' : ''}</span>
         <div style={{ flex: 1 }} />
-        <span style={{ fontSize: 16, fontWeight: 700, color: mtmColor, fontFamily: 'monospace' }}>{fmtMtm(groupMtm)}</span>
-        <span style={{ fontSize: 11, color: '#6B7280', fontWeight: 500, textTransform: 'uppercase', letterSpacing: '0.05em' }}>net mtm</span>
+        <span style={{ fontSize: 16, fontWeight: 700, color: mtmColor, fontFamily: '-apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif' }}>{fmtMtm(groupMtm)}</span>
+        <span style={{ fontSize: 11, color: '#6B7280', fontWeight: 500, textTransform: 'capitalize', letterSpacing: '0.03em' }}>net mtm</span>
       </div>
       {/* TanStack Legs */}
       {showGreeks ? (
@@ -340,13 +787,15 @@ function MtmGroupTable({ group, showGreeks, columns }: { group: { symbol: string
   );
 }
 
-function MtmLayout({ visible, workerRef, workerReady, workerModeRef, mtmResultsCbRef, instruments }: {
+function MtmLayout({ visible, workerRef, workerReady, workerModeRef, mtmResultsCbRef, instruments, onAddToBasket, execBasketRef }: {
   visible: boolean;
   workerRef: React.RefObject<Worker | null>;
   workerReady: React.RefObject<boolean>;
   workerModeRef: React.RefObject<'header' | 'chart' | 'mtm'>;
   mtmResultsCbRef: React.RefObject<((results: Instrument[]) => void) | null>;
   instruments: Instrument[];
+  onAddToBasket?: (leg: BasketLeg) => void;
+  execBasketRef?: React.RefObject<((legs: BasketLeg[]) => void) | null>;
 }) {
   const containerRef = useRef<HTMLDivElement>(null);
   const [leftPct, setLeftPct] = useState(45);
@@ -357,14 +806,61 @@ function MtmLayout({ visible, workerRef, workerReady, workerModeRef, mtmResultsC
   const ocSpotRef = useRef(0); // latest spot from option chain feed
   const [showGreeks, setShowGreeks] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [layoutTheme, setLayoutTheme] = useState<'theme1' | 'theme2'>('theme1');
 
-  const ZERO_GREEKS: Greeks = { delta: 0, theta: 0, vega: 0, gamma: 0, iv: 0 };
-  const addLeg = useCallback((leg: Omit<Leg, 'id' | 'entrySpot' | 'entryTime' | 'currLtp' | 'checked' | 'currGreeks' | 'entryGreeks'> & { greeks: Greeks }) => {
-    const now = new Date();
-    const entryTime = now.toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false });
-    const { greeks, ...rest } = leg;
-    setLegs(prev => [...prev, { ...rest, id: ++legIdRef.current, entrySpot: ocSpotRef.current, entryTime, currLtp: leg.price, checked: true, entryGreeks: greeks, currGreeks: greeks, lotSize: rest.lotSize ?? 1 }]);
-  }, []);
+  // Register "add basket legs to MTM" function into execBasketRef so App can call it on Execute
+  useEffect(() => {
+    if (!execBasketRef) return;
+    (execBasketRef as React.RefObject<((legs: BasketLeg[]) => void) | null>).current = (basketLegsToAdd: BasketLeg[]) => {
+      const now = new Date();
+      const entryDate = new Date(now.getTime() + 5.5 * 3600 * 1000).toISOString().slice(0, 10);
+      const entryTime = now.toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false });
+      const ZERO: Greeks = { delta: 0, theta: 0, vega: 0, gamma: 0, iv: 0 };
+      // Single setLegs call so React sees one state update and WS effect re-runs correctly
+      setLegs(prev => [
+        ...prev,
+        ...basketLegsToAdd.map(bl => ({
+          id: ++legIdRef.current,
+          symbol: bl.symbol,
+          expiry: bl.expiry,
+          strike: bl.strike,
+          type: bl.type,
+          action: bl.action,
+          lots: bl.lots,
+          lotSize: bl.lotSize,
+          price: bl.price,
+          refId: bl.refId,
+          instrumentKey: bl.instrumentKey,
+          entrySpot: ocSpotRef.current,
+          entryTime,
+          entryDate,
+          currLtp: bl.price,
+          checked: true,
+          entryGreeks: bl.greeks ?? ZERO,
+          currGreeks: bl.greeks ?? ZERO,
+        })),
+      ]);
+    };
+    return () => { if (execBasketRef) (execBasketRef as React.RefObject<((legs: BasketLeg[]) => void) | null>).current = null; };
+  }, [execBasketRef]);
+
+  // addLeg: only sends to basket — MTM legs are added on Execute
+  const addLeg = useCallback((leg: { symbol: string; expiry: string; strike: number; type: 'CE' | 'PE'; action: 'B' | 'S'; price: number; lots: number; lotSize: number; refId?: number; instrumentKey?: string; greeks: Greeks }) => {
+    onAddToBasket?.({
+      id: Date.now() + Math.random(),
+      symbol: leg.symbol,
+      expiry: leg.expiry,
+      strike: leg.strike,
+      type: leg.type,
+      action: leg.action,
+      lots: leg.lots,
+      lotSize: leg.lotSize ?? 1,
+      price: leg.price,
+      greeks: leg.greeks,
+      refId: leg.refId,
+      instrumentKey: leg.instrumentKey,
+    });
+  }, [onAddToBasket]);
 
   const removeLeg = useCallback((id: number) => {
     setLegs(prev => prev.filter(l => l.id !== id));
@@ -449,6 +945,34 @@ function MtmLayout({ visible, workerRef, workerReady, workerModeRef, mtmResultsC
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [legs.map(l => l.refId).join(',')]);
 
+  // ── MCX live LTP via Upstox wsManager ────────────────────────────────────────
+  useEffect(() => {
+    const mcxLegs = legs.filter(l => l.instrumentKey);
+    if (!mcxLegs.length) return;
+    const keys = mcxLegs.map(l => l.instrumentKey!);
+    wsManager.requestKeys(keys);
+    // Seed immediately from cache
+    setLegs(prev => prev.map(leg => {
+      if (!leg.instrumentKey) return leg;
+      const snap = wsManager.get(leg.instrumentKey);
+      if (!snap?.ltp) return leg;
+      return { ...leg, currLtp: snap.ltp };
+    }));
+    const unsubs = mcxLegs.map(leg =>
+      wsManager.subscribe(leg.instrumentKey!, md => {
+        if (!md.ltp) return;
+        setLegs(prev => {
+          const idx = prev.findIndex(l => l.id === leg.id);
+          if (idx === -1 || prev[idx].currLtp === md.ltp) return prev;
+          const next = [...prev];
+          next[idx] = { ...next[idx], currLtp: md.ltp };
+          return next;
+        });
+      })
+    );
+    return () => unsubs.forEach(u => u());
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [legs.map(l => l.instrumentKey ?? '').join(',')]);
 
   const stdColumns = useMemo(() => [
     columnHelper.display({
@@ -519,7 +1043,7 @@ function MtmLayout({ visible, workerRef, workerReady, workerModeRef, mtmResultsC
       header: () => <span style={{ fontSize: 12, color: '#9CA3AF', fontWeight: 700 }}>Strike</span>,
       cell: ({ row }) => (
         <div style={{ height: 26, borderRadius: 5, background: 'rgba(255,255,255,0.02)', border: '1px solid rgba(255,255,255,0.07)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-          <span style={{ fontSize: 13, fontWeight: 700, color: '#60a5fa', fontFamily: 'monospace' }}>{row.original.strike}</span>
+          <span style={{ fontSize: 13, fontWeight: 700, color: '#60a5fa', fontFamily: '-apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif' }}>{row.original.strike}</span>
         </div>
       )
     }),
@@ -528,7 +1052,7 @@ function MtmLayout({ visible, workerRef, workerReady, workerModeRef, mtmResultsC
       header: () => <span style={{ fontSize: 12, color: '#9CA3AF', fontWeight: 700 }}>Price</span>,
       cell: ({ row }) => (
         <div style={{ height: 26, borderRadius: 5, background: 'rgba(255,255,255,0.02)', border: '1px solid rgba(255,255,255,0.07)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-          <span style={{ fontSize: 13, fontWeight: 600, color: '#D1D4DC', fontFamily: 'monospace' }}>₹{row.original.price.toFixed(2)}</span>
+          <span style={{ fontSize: 13, fontWeight: 600, color: '#D1D4DC', fontFamily: '-apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif' }}>₹{row.original.price.toFixed(2)}</span>
         </div>
       )
     }),
@@ -537,7 +1061,7 @@ function MtmLayout({ visible, workerRef, workerReady, workerModeRef, mtmResultsC
       header: () => <span style={{ fontSize: 12, color: '#9CA3AF', fontWeight: 700 }}>LTP</span>,
       cell: ({ row }) => (
         <div style={{ height: 26, borderRadius: 5, background: 'rgba(255,255,255,0.02)', border: '1px solid rgba(255,255,255,0.07)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-          <span style={{ fontSize: 13, fontWeight: 700, color: '#E2E8F0', fontFamily: 'monospace' }}>₹{(row.original.currLtp > 0 ? row.original.currLtp : row.original.price).toFixed(2)}</span>
+          <span style={{ fontSize: 13, fontWeight: 700, color: '#E2E8F0', fontFamily: '-apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif' }}>₹{(row.original.currLtp > 0 ? row.original.currLtp : row.original.price).toFixed(2)}</span>
         </div>
       )
     }),
@@ -546,7 +1070,7 @@ function MtmLayout({ visible, workerRef, workerReady, workerModeRef, mtmResultsC
       header: () => <span style={{ fontSize: 12, color: '#9CA3AF', fontWeight: 700 }}>Spot</span>,
       cell: ({ row }) => (
         <div style={{ height: 26, borderRadius: 5, background: 'rgba(255,255,255,0.02)', border: '1px solid rgba(255,255,255,0.07)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-          <span style={{ fontSize: 13, fontWeight: 600, color: '#6B7280', fontFamily: 'monospace' }}>{row.original.entrySpot > 0 ? row.original.entrySpot.toFixed(2) : '—'}</span>
+          <span style={{ fontSize: 13, fontWeight: 600, color: '#6B7280', fontFamily: '-apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif' }}>{row.original.entrySpot > 0 ? row.original.entrySpot.toFixed(2) : '—'}</span>
         </div>
       )
     }),
@@ -569,7 +1093,7 @@ function MtmLayout({ visible, workerRef, workerReady, workerModeRef, mtmResultsC
         const pos = mtm >= 0;
         return (
           <div style={{ height: 26, borderRadius: 5, background: pos ? 'rgba(38,166,154,0.1)' : 'rgba(242,54,69,0.1)', border: `1px solid ${pos ? 'rgba(38,166,154,0.25)' : 'rgba(242,54,69,0.25)'}`, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-            <span style={{ fontSize: 13, fontWeight: 800, color: pos ? '#26a69a' : '#f23645', fontFamily: 'monospace' }}>{fmtMtm(mtm)}</span>
+            <span style={{ fontSize: 13, fontWeight: 800, color: pos ? '#26a69a' : '#f23645', fontFamily: '-apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif' }}>{fmtMtm(mtm)}</span>
           </div>
         );
       }
@@ -589,8 +1113,8 @@ function MtmLayout({ visible, workerRef, workerReady, workerModeRef, mtmResultsC
   ], [updateLeg, removeLeg]);
 
   const greeksColumns = useMemo(() => [
-    columnHelper.display({ id: 'position', header: () => <div style={{ width: 90, paddingLeft: 10, flexShrink: 0, display: 'flex', alignItems: 'center' }}><span style={{ fontSize: 12, color: '#9CA3AF', fontWeight: 700, letterSpacing: '0.04em', textTransform: 'uppercase', whiteSpace: 'nowrap' }}>Position</span></div>, cell: ({ row }) => { const leg = row.original; const isBuy = leg.action === 'B'; return <div style={{ display: 'flex', flexDirection: 'column', justifyContent: 'center', gap: 6, padding: '8px 10px', borderRight: '1px solid rgba(255,255,255,0.05)', flexShrink: 0, width: 90, background: 'rgba(0,0,0,0.12)' }}><div style={{ display: 'flex', alignItems: 'center', gap: 5 }}><div onClick={() => updateLeg(leg.id, { checked: !leg.checked })} style={{ width: 14, height: 14, borderRadius: 3, background: leg.checked ? 'rgba(129,140,248,0.2)' : 'rgba(255,255,255,0.04)', border: `1px solid ${leg.checked ? 'rgba(129,140,248,0.6)' : 'rgba(255,255,255,0.15)'}`, display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0, cursor: 'pointer' }}>{leg.checked && <svg width="9" height="9" viewBox="0 0 10 10" fill="none"><path d="M2 5l2.5 2.5L8 3" stroke="#818cf8" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" /></svg>}</div><div onClick={() => updateLeg(leg.id, { action: leg.action === 'B' ? 'S' : 'B' })} style={{ padding: '0px 6px', height: 18, borderRadius: 3, background: isBuy ? 'rgba(38,166,154,0.15)' : 'rgba(242,54,69,0.15)', border: `1px solid ${isBuy ? 'rgba(38,166,154,0.4)' : 'rgba(242,54,69,0.4)'}`, cursor: 'pointer', display: 'flex', alignItems: 'center' }}><span style={{ fontSize: 11, fontWeight: 800, color: isBuy ? '#26a69a' : '#f23645' }}>{leg.action}</span></div><span style={{ fontSize: 11, fontWeight: 800, color: leg.type === 'CE' ? '#facc15' : '#c084fc', letterSpacing: '0.02em' }}>{leg.type}</span></div><div style={{ display: 'flex', alignItems: 'center', gap: 6 }}><span style={{ fontSize: 13, fontWeight: 800, color: '#E2E8F0', fontFamily: 'monospace', lineHeight: 1 }}>{leg.strike}</span><div style={{ background: 'rgba(255,255,255,0.06)', border: '1px solid rgba(255,255,255,0.08)', borderRadius: 4, padding: '2px 5px', display: 'flex', alignItems: 'center', justifyContent: 'center' }}><span style={{ fontSize: 10, color: '#9CA3AF', fontWeight: 700, fontFamily: 'monospace', lineHeight: 1 }}>{leg.lots}x</span></div></div></div>; } }),
-    ...greekItems.map((gk, gi) => columnHelper.display({ id: gk.key, header: () => <div style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', gap: 2, padding: '0 6px', alignItems: 'center' }}><div style={{ display: 'flex', alignItems: 'baseline', gap: 4 }}><span style={{ fontSize: 13, color: gk.color, fontWeight: 800, letterSpacing: '0.02em' }}>{gk.label}</span><span style={{ fontSize: 11, color: '#9CA3AF', fontWeight: 600, letterSpacing: '0.04em', textTransform: 'uppercase', whiteSpace: 'nowrap' }}>{gk.name}</span></div><div style={{ display: 'flex', width: '100%', justifyContent: 'space-between', padding: '0 2px' }}><span style={{ fontSize: 10, color: 'rgba(156,163,175,0.5)', fontWeight: 600, letterSpacing: '0.03em' }}>Ent</span><span style={{ fontSize: 10, color: 'rgba(156,163,175,0.7)', fontWeight: 700, letterSpacing: '0.03em' }}>Live</span></div></div>, cell: ({ row }) => { const leg = row.original; const isIv = gk.key === 'iv'; const rawCurr = leg.currGreeks[gk.key]; const rawEntry = leg.entryGreeks[gk.key]; const curr = isIv ? rawCurr * 100 : rawCurr; const entry = isIv ? rawEntry * 100 : rawEntry; const chg = curr - entry; const chgColor = chg > 0 ? '#26a69a' : chg < 0 ? '#f23645' : '#6B7280'; return <div style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', justifyContent: 'center', padding: '4px 6px', borderRight: gi < 4 ? '1px solid rgba(255,255,255,0.12)' : 'none', height: '100%', gap: 2 }}><div style={{ display: 'flex', width: '100%', justifyContent: 'space-between', alignItems: 'center' }}><span style={{ fontSize: 12, color: '#9CA3AF', fontFamily: 'monospace', fontWeight: 600 }}>{fmtG(entry, gk.dec)}{isIv ? '%' : ''}</span><span style={{ fontSize: 14, fontWeight: 800, color: gk.color, fontFamily: 'monospace' }}>{fmtG(curr, gk.dec)}{isIv ? '%' : ''}</span></div><div style={{ display: 'flex', justifyContent: 'center' }}><span style={{ fontSize: 13, fontWeight: 700, color: chgColor, fontFamily: 'monospace' }}>{entry !== 0 ? `${chg >= 0 ? '+' : ''}${parseFloat(chg.toFixed(gk.dec))}${isIv ? '%' : ''}` : '—'}</span></div></div>; } })),
+    columnHelper.display({ id: 'position', header: () => <div style={{ width: 90, paddingLeft: 10, flexShrink: 0, display: 'flex', alignItems: 'center' }}><span style={{ fontSize: 12, color: '#9CA3AF', fontWeight: 700, letterSpacing: '0.04em', textTransform: 'uppercase', whiteSpace: 'nowrap' }}>Position</span></div>, cell: ({ row }) => { const leg = row.original; const isBuy = leg.action === 'B'; return <div style={{ display: 'flex', flexDirection: 'column', justifyContent: 'center', gap: 6, padding: '8px 10px', borderRight: '1px solid rgba(255,255,255,0.05)', flexShrink: 0, width: 90, background: 'rgba(0,0,0,0.12)' }}><div style={{ display: 'flex', alignItems: 'center', gap: 5 }}><div onClick={() => updateLeg(leg.id, { checked: !leg.checked })} style={{ width: 14, height: 14, borderRadius: 3, background: leg.checked ? 'rgba(129,140,248,0.2)' : 'rgba(255,255,255,0.04)', border: `1px solid ${leg.checked ? 'rgba(129,140,248,0.6)' : 'rgba(255,255,255,0.15)'}`, display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0, cursor: 'pointer' }}>{leg.checked && <svg width="9" height="9" viewBox="0 0 10 10" fill="none"><path d="M2 5l2.5 2.5L8 3" stroke="#818cf8" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" /></svg>}</div><div onClick={() => updateLeg(leg.id, { action: leg.action === 'B' ? 'S' : 'B' })} style={{ padding: '0px 6px', height: 18, borderRadius: 3, background: isBuy ? 'rgba(38,166,154,0.15)' : 'rgba(242,54,69,0.15)', border: `1px solid ${isBuy ? 'rgba(38,166,154,0.4)' : 'rgba(242,54,69,0.4)'}`, cursor: 'pointer', display: 'flex', alignItems: 'center' }}><span style={{ fontSize: 11, fontWeight: 800, color: isBuy ? '#26a69a' : '#f23645' }}>{leg.action}</span></div><span style={{ fontSize: 11, fontWeight: 800, color: leg.type === 'CE' ? '#facc15' : '#c084fc', letterSpacing: '0.02em' }}>{leg.type}</span></div><div style={{ display: 'flex', alignItems: 'center', gap: 6 }}><span style={{ fontSize: 13, fontWeight: 800, color: '#E2E8F0', fontFamily: '-apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif', lineHeight: 1 }}>{leg.strike}</span><div style={{ background: 'rgba(255,255,255,0.06)', border: '1px solid rgba(255,255,255,0.08)', borderRadius: 4, padding: '2px 5px', display: 'flex', alignItems: 'center', justifyContent: 'center' }}><span style={{ fontSize: 10, color: '#9CA3AF', fontWeight: 700, fontFamily: '-apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif', lineHeight: 1 }}>{leg.lots}x</span></div></div></div>; } }),
+    ...greekItems.map((gk, gi) => columnHelper.display({ id: gk.key, header: () => <div style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', gap: 2, padding: '0 6px', alignItems: 'center' }}><div style={{ display: 'flex', alignItems: 'baseline', gap: 4 }}><span style={{ fontSize: 13, color: gk.color, fontWeight: 800, letterSpacing: '0.02em' }}>{gk.label}</span><span style={{ fontSize: 11, color: '#9CA3AF', fontWeight: 600, letterSpacing: '0.04em', textTransform: 'uppercase', whiteSpace: 'nowrap' }}>{gk.name}</span></div><div style={{ display: 'flex', width: '100%', justifyContent: 'space-between', padding: '0 2px' }}><span style={{ fontSize: 10, color: 'rgba(156,163,175,0.5)', fontWeight: 600, letterSpacing: '0.03em' }}>Ent</span><span style={{ fontSize: 10, color: 'rgba(156,163,175,0.7)', fontWeight: 700, letterSpacing: '0.03em' }}>Live</span></div></div>, cell: ({ row }) => { const leg = row.original; const isIv = gk.key === 'iv'; const rawCurr = leg.currGreeks[gk.key]; const rawEntry = leg.entryGreeks[gk.key]; const curr = isIv ? rawCurr * 100 : rawCurr; const entry = isIv ? rawEntry * 100 : rawEntry; const chg = curr - entry; const chgColor = chg > 0 ? '#26a69a' : chg < 0 ? '#f23645' : '#6B7280'; return <div style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', justifyContent: 'center', padding: '4px 6px', borderRight: gi < 4 ? '1px solid rgba(255,255,255,0.12)' : 'none', height: '100%', gap: 2 }}><div style={{ display: 'flex', width: '100%', justifyContent: 'space-between', alignItems: 'center' }}><span style={{ fontSize: 12, color: '#9CA3AF', fontFamily: '-apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif', fontWeight: 600 }}>{fmtG(entry, gk.dec)}{isIv ? '%' : ''}</span><span style={{ fontSize: 14, fontWeight: 800, color: gk.color, fontFamily: '-apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif' }}>{fmtG(curr, gk.dec)}{isIv ? '%' : ''}</span></div><div style={{ display: 'flex', justifyContent: 'center' }}><span style={{ fontSize: 13, fontWeight: 700, color: chgColor, fontFamily: '-apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif' }}>{entry !== 0 ? `${chg >= 0 ? '+' : ''}${parseFloat(chg.toFixed(gk.dec))}${isIv ? '%' : ''}` : '—'}</span></div></div>; } })),
     columnHelper.display({ id: 'delete', header: () => <div style={{ width: 34, flexShrink: 0 }} />, cell: ({ row }) => <div style={{ display: 'flex', alignItems: 'center', padding: '0 6px', borderLeft: '1px solid rgba(255,255,255,0.03)', flexShrink: 0, height: '100%' }}><button onClick={() => removeLeg(row.original.id)} style={{ background: 'transparent', border: 'none', cursor: 'pointer', color: '#1f2937', display: 'flex', alignItems: 'center', padding: 2, borderRadius: 4 }} onMouseEnter={e => (e.currentTarget.style.color = '#f23645')} onMouseLeave={e => (e.currentTarget.style.color = '#1f2937')}><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><polyline points="3 6 5 6 21 6" /><path d="M19 6l-1 14H6L5 6" /><path d="M10 11v6M14 11v6" /><path d="M9 6V4h6v2" /></svg></button></div> })
   ], [updateLeg, removeLeg]);
 
@@ -746,9 +1270,9 @@ function MtmLayout({ visible, workerRef, workerReady, workerModeRef, mtmResultsC
       style={{ display: visible ? 'flex' : 'none', padding: 12, gap: 12, background: 'var(--bg-base)' }}
     >
       {/* Left panel */}
-      <div style={{ width: `${leftPct}%`, background: '#171717', borderRadius: 10, border: '1px solid rgba(255,255,255,0.08)', display: 'flex', flexDirection: 'column', position: 'relative' }}>
+      <div style={{ width: `${leftPct}%`, background: '#171717', borderRadius: 10, border: '1px solid rgba(255,255,255,0.08)', display: 'flex', flexDirection: 'column', position: 'relative', overflow: 'hidden', minHeight: 0 }}>
         {/* Search bar + dropdown */}
-        <div style={{ padding: '12px 14px', position: 'relative', display: 'flex', alignItems: 'center', gap: 10 }}>
+        <div style={{ padding: '7px 10px', position: 'relative', display: 'flex', alignItems: 'center', gap: 8, flexShrink: 0 }}>
           <div style={{ width: '55%', position: 'relative' }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: 8, background: 'rgba(255,255,255,0.03)', border: '1px solid rgba(255,255,255,0.06)', borderRadius: 8, padding: '0 12px', height: 36, transition: 'all 0.2s', boxShadow: 'inset 0 2px 4px rgba(0,0,0,0.1)' }}>
               <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#565A6B" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="11" cy="11" r="8" /><path d="m21 21-4.35-4.35" /></svg>
@@ -802,11 +1326,48 @@ function MtmLayout({ visible, workerRef, workerReady, workerModeRef, mtmResultsC
                   ))}
                 </div>
                 <div style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '6px 14px', borderTop: '1px solid rgba(255,255,255,0.06)', background: 'rgba(0,0,0,0.2)', flexShrink: 0 }}>
-                  <span style={{ fontSize: 11, color: '#4A4E5C' }}><kbd style={{ fontFamily: 'monospace' }}>↵</kbd> select</span>
-                  <span style={{ fontSize: 11, color: '#4A4E5C' }}><kbd style={{ fontFamily: 'monospace' }}>Esc</kbd> close</span>
+                  <span style={{ fontSize: 11, color: '#4A4E5C' }}><kbd style={{ fontFamily: '-apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif' }}>↵</kbd> select</span>
+                  <span style={{ fontSize: 11, color: '#4A4E5C' }}><kbd style={{ fontFamily: '-apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif' }}>Esc</kbd> close</span>
                 </div>
               </div>
             )}
+          </div>
+          <div style={{ flex: 1 }} />
+          {/* Layout theme switcher — far right */}
+          <div style={{ display: 'flex', alignItems: 'center', gap: 4, flexShrink: 0 }}>
+            {([
+              { t: 'theme1' as const, label: 'Cards', icon: (
+                <svg width="15" height="15" viewBox="0 0 16 16" fill="currentColor">
+                  <rect x="1" y="1" width="6" height="6" rx="1.5" opacity="0.9" />
+                  <rect x="9" y="1" width="6" height="6" rx="1.5" opacity="0.9" />
+                  <rect x="1" y="9" width="6" height="6" rx="1.5" opacity="0.9" />
+                  <rect x="9" y="9" width="6" height="6" rx="1.5" opacity="0.9" />
+                </svg>
+              )},
+              { t: 'theme2' as const, label: 'Table', icon: (
+                <svg width="15" height="15" viewBox="0 0 16 16" fill="currentColor">
+                  <rect x="1" y="1" width="14" height="3.5" rx="1.5" opacity="0.9" />
+                  <rect x="1" y="6.25" width="14" height="3.5" rx="1.5" opacity="0.7" />
+                  <rect x="1" y="11.5" width="14" height="3.5" rx="1.5" opacity="0.5" />
+                </svg>
+              )},
+            ]).map(({ t, label, icon }) => (
+              <button
+                key={t}
+                onClick={() => setLayoutTheme(t)}
+                style={{
+                  display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 2,
+                  padding: '5px 8px', borderRadius: 7, border: 'none', cursor: 'pointer',
+                  background: layoutTheme === t ? 'rgba(79,142,247,0.18)' : 'rgba(255,255,255,0.03)',
+                  color: layoutTheme === t ? '#4F8EF7' : '#4B5563',
+                  outline: layoutTheme === t ? '1px solid rgba(79,142,247,0.35)' : '1px solid rgba(255,255,255,0.06)',
+                  transition: 'all 0.15s', minWidth: 44,
+                }}
+              >
+                {icon}
+                <span style={{ fontSize: 9, fontWeight: 600, letterSpacing: '0.04em', textTransform: 'uppercase' }}>{label}</span>
+              </button>
+            ))}
           </div>
           {/* Settings button */}
           <button onClick={() => setSettingsOpen(true)} style={{ flexShrink: 0, width: 36, height: 36, background: settingsOpen ? 'rgba(255,255,255,0.08)' : 'rgba(255,255,255,0.03)', border: '1px solid rgba(255,255,255,0.06)', borderRadius: 8, display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer', transition: 'all 0.2s' }}
@@ -818,7 +1379,7 @@ function MtmLayout({ visible, workerRef, workerReady, workerModeRef, mtmResultsC
         </div>
         {/* Settings modal */}
         {settingsOpen && (
-          <div style={{ position: 'absolute', top: 44, left: 8, zIndex: 100, background: '#1a1a1a', border: '1px solid rgba(255,255,255,0.1)', borderRadius: 10, padding: '14px 16px', boxShadow: '0 8px 32px rgba(0,0,0,0.6)', minWidth: 220 }}>
+          <div style={{ position: 'absolute', top: 44, right: 8, zIndex: 100, background: '#1a1a1a', border: '1px solid rgba(255,255,255,0.1)', borderRadius: 10, padding: '14px 16px', boxShadow: '0 8px 32px rgba(0,0,0,0.6)', minWidth: 220 }}>
             <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 12 }}>
               <span style={{ fontSize: 12, fontWeight: 700, color: '#E2E8F0', letterSpacing: '0.04em' }}>Display Settings</span>
               <button onClick={() => setSettingsOpen(false)} style={{ background: 'none', border: 'none', cursor: 'pointer', color: '#4B5563', display: 'flex', padding: 0 }}>
@@ -838,108 +1399,116 @@ function MtmLayout({ visible, workerRef, workerReady, workerModeRef, mtmResultsC
           </div>
         )}
         {/* Separator */}
-        <div style={{ height: 1, background: 'rgba(255,255,255,0.04)', margin: '0 14px 10px 4px' }} />
-        {/* Leg rows table */}
-        <div style={{ flex: 1, padding: '0 10px 14px 10px', overflowX: 'auto', overflowY: 'auto', scrollbarWidth: 'thin', scrollbarColor: '#2a2a2a transparent' }}>
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
-            {/* Shared column header row */}
-            {showGreeks ? (
-              <div style={{ background: '#333333', borderRadius: 6, display: 'flex', alignItems: 'center', gap: 0, padding: '8px 11px' }}>
-                {headerTable.getHeaderGroups().map(hg => (
-                  <React.Fragment key={hg.id}>
-                    {hg.headers.map(h => (
-                      <React.Fragment key={h.id}>{flexRender(h.column.columnDef.header, h.getContext())}</React.Fragment>
-                    ))}
-                  </React.Fragment>
-                ))}
-              </div>
-            ) : (
-              <table style={{ width: '100%', borderCollapse: 'collapse', tableLayout: 'fixed' }}>
-                <colgroup>
-                  {headerTable.getAllColumns().map(col => (
-                    <col key={col.id} style={{ width: col.getSize() }} />
-                  ))}
-                </colgroup>
-                <thead>
-                  {headerTable.getHeaderGroups().map(hg => (
-                    <tr key={hg.id} style={{ background: '#333333', borderRadius: 6 }}>
-                      {hg.headers.map(h => (
-                        <th key={h.id} style={{ padding: '8px 6px', textAlign: 'left', fontWeight: 700, fontSize: 11, color: '#9CA3AF', letterSpacing: '0.04em', textTransform: 'uppercase', whiteSpace: 'nowrap' }}>
-                          {flexRender(h.column.columnDef.header, h.getContext())}
-                        </th>
-                      ))}
-                    </tr>
-                  ))}
-                </thead>
-              </table>
-            )}
-            {legs.length === 0 && (
-              <div style={{ padding: '24px', textAlign: 'center', color: '#3D4150', fontSize: 13 }}>
-                No legs yet — click B or S on the option chain to add
-              </div>
-            )}
-            {(() => {
-              // Group legs by symbol
-              const groups: { symbol: string; legs: Leg[] }[] = [];
-              for (const leg of legs) {
-                const g = groups.find(g => g.symbol === leg.symbol);
-                if (g) g.legs.push(leg);
-                else groups.push({ symbol: leg.symbol, legs: [leg] });
-              }
-              return groups.map(group => (
-                <MtmGroupTable key={group.symbol} group={group} showGreeks={showGreeks} columns={showGreeks ? greeksColumns : stdColumns} />
-              ));
-            })()}
+        <div style={{ height: 1, background: 'rgba(255,255,255,0.04)', margin: '0 14px 10px 4px', flexShrink: 0 }} />
 
-            {/* Add Legs button */}
-            {ocSymbol && (
-              <div style={{ padding: '8px 10px 4px' }}>
-                <button
-                  onClick={() => setOcOpen(true)}
-                  style={{
-                    display: 'flex',
-                    alignItems: 'center',
-                    justifyContent: 'center',
-                    gap: 7,
-                    padding: '7px 20px',
-                    background: 'linear-gradient(135deg, #3b82f6 0%, #2563eb 100%)',
-                    border: 'none',
-                    borderRadius: 7,
-                    color: '#ffffff',
-                    fontSize: 12,
-                    fontWeight: 600,
-                    letterSpacing: '0.03em',
-                    cursor: 'pointer',
-                    transition: 'opacity 0.15s, transform 0.1s',
-                    width: 'fit-content',
-                    boxShadow: '0 2px 8px rgba(37,99,235,0.35)',
-                  }}
-                  onMouseEnter={e => {
-                    (e.currentTarget as HTMLButtonElement).style.opacity = '0.88';
-                    (e.currentTarget as HTMLButtonElement).style.transform = 'translateY(-1px)';
-                  }}
-                  onMouseLeave={e => {
-                    (e.currentTarget as HTMLButtonElement).style.opacity = '1';
-                    (e.currentTarget as HTMLButtonElement).style.transform = 'translateY(0)';
-                  }}
-                  onMouseDown={e => {
-                    (e.currentTarget as HTMLButtonElement).style.transform = 'translateY(0)';
-                    (e.currentTarget as HTMLButtonElement).style.opacity = '0.75';
-                  }}
-                  onMouseUp={e => {
-                    (e.currentTarget as HTMLButtonElement).style.opacity = '0.88';
-                    (e.currentTarget as HTMLButtonElement).style.transform = 'translateY(-1px)';
-                  }}
-                >
-                  <svg width="11" height="11" viewBox="0 0 11 11" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round">
-                    <path d="M5.5 1v9M1 5.5h9" />
-                  </svg>
-                  Add Legs
-                </button>
-              </div>
-            )}
+        {/* Leg rows table */}
+        {layoutTheme === 'theme2' ? (
+          /* ── Theme 2: flat TanStack table ── */
+          <MtmTheme2Table legs={legs} updateLeg={updateLeg} removeLeg={removeLeg} showGreeks={showGreeks} />
+        ) : (
+          /* ── Theme 1: card / grouped layout ── */
+          <div style={{ flex: 1, padding: '0 10px 14px 10px', overflowX: 'auto', overflowY: 'auto', scrollbarWidth: 'thin', scrollbarColor: '#2a2a2a transparent' }}>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+              {/* Shared column header row */}
+              {showGreeks ? (
+                <div style={{ background: '#333333', borderRadius: 6, display: 'flex', alignItems: 'center', gap: 0, padding: '8px 11px' }}>
+                  {headerTable.getHeaderGroups().map(hg => (
+                    <React.Fragment key={hg.id}>
+                      {hg.headers.map(h => (
+                        <React.Fragment key={h.id}>{flexRender(h.column.columnDef.header, h.getContext())}</React.Fragment>
+                      ))}
+                    </React.Fragment>
+                  ))}
+                </div>
+              ) : (
+                <table style={{ width: '100%', borderCollapse: 'collapse', tableLayout: 'fixed' }}>
+                  <colgroup>
+                    {headerTable.getAllColumns().map(col => (
+                      <col key={col.id} style={{ width: col.getSize() }} />
+                    ))}
+                  </colgroup>
+                  <thead>
+                    {headerTable.getHeaderGroups().map(hg => (
+                      <tr key={hg.id} style={{ background: '#333333', borderRadius: 6 }}>
+                        {hg.headers.map(h => (
+                          <th key={h.id} style={{ padding: '8px 6px', textAlign: 'left', fontWeight: 700, fontSize: 11, color: '#9CA3AF', letterSpacing: '0.04em', textTransform: 'uppercase', whiteSpace: 'nowrap' }}>
+                            {flexRender(h.column.columnDef.header, h.getContext())}
+                          </th>
+                        ))}
+                      </tr>
+                    ))}
+                  </thead>
+                </table>
+              )}
+              {legs.length === 0 && (
+                <div style={{ padding: '24px', textAlign: 'center', color: '#3D4150', fontSize: 13 }}>
+                  No legs yet — click B or S on the option chain to add
+                </div>
+              )}
+              {(() => {
+                // Group legs by symbol
+                const groups: { symbol: string; legs: Leg[] }[] = [];
+                for (const leg of legs) {
+                  const g = groups.find(g => g.symbol === leg.symbol);
+                  if (g) g.legs.push(leg);
+                  else groups.push({ symbol: leg.symbol, legs: [leg] });
+                }
+                return groups.map(group => (
+                  <MtmGroupTable key={group.symbol} group={group} showGreeks={showGreeks} columns={showGreeks ? greeksColumns : stdColumns} />
+                ));
+              })()}
+
+              {/* Add Legs button */}
+              {ocSymbol && (
+                <div style={{ padding: '8px 10px 4px' }}>
+                  <button
+                    onClick={() => setOcOpen(true)}
+                    style={{
+                      display: 'flex',
+                      alignItems: 'center',
+                      justifyContent: 'center',
+                      gap: 7,
+                      padding: '7px 20px',
+                      background: 'linear-gradient(135deg, #3b82f6 0%, #2563eb 100%)',
+                      border: 'none',
+                      borderRadius: 7,
+                      color: '#ffffff',
+                      fontSize: 12,
+                      fontWeight: 600,
+                      letterSpacing: '0.03em',
+                      cursor: 'pointer',
+                      transition: 'opacity 0.15s, transform 0.1s',
+                      width: 'fit-content',
+                      boxShadow: '0 2px 8px rgba(37,99,235,0.35)',
+                    }}
+                    onMouseEnter={e => {
+                      (e.currentTarget as HTMLButtonElement).style.opacity = '0.88';
+                      (e.currentTarget as HTMLButtonElement).style.transform = 'translateY(-1px)';
+                    }}
+                    onMouseLeave={e => {
+                      (e.currentTarget as HTMLButtonElement).style.opacity = '1';
+                      (e.currentTarget as HTMLButtonElement).style.transform = 'translateY(0)';
+                    }}
+                    onMouseDown={e => {
+                      (e.currentTarget as HTMLButtonElement).style.transform = 'translateY(0)';
+                      (e.currentTarget as HTMLButtonElement).style.opacity = '0.75';
+                    }}
+                    onMouseUp={e => {
+                      (e.currentTarget as HTMLButtonElement).style.opacity = '0.88';
+                      (e.currentTarget as HTMLButtonElement).style.transform = 'translateY(-1px)';
+                    }}
+                  >
+                    <svg width="11" height="11" viewBox="0 0 11 11" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round">
+                      <path d="M5.5 1v9M1 5.5h9" />
+                    </svg>
+                    Add Legs
+                  </button>
+                </div>
+              )}
+            </div>
           </div>
-        </div>
+        )}
+
 
       </div>
 
@@ -981,7 +1550,7 @@ function MtmLayout({ visible, workerRef, workerReady, workerModeRef, mtmResultsC
           display: 'flex', flexDirection: 'column',
           overflow: 'hidden',
         }}>
-          <OptionChain symbol={ocSymbol} expiries={ocExpiries} sessionToken={nubraSession} exchange={ocExchange} onClose={() => setOcOpen(false)} onAddLeg={addLeg} onLtpUpdateRef={{ current: onLtpUpdate }} lotSize={ocLotSize} />
+          <OptionChain symbol={ocSymbol} expiries={ocExpiries} sessionToken={nubraSession} exchange={ocExchange} onClose={() => setOcOpen(false)} onAddLeg={addLeg} onLtpUpdateRef={{ current: onLtpUpdate }} lotSize={ocLotSize} instruments={instruments} ocSpotRef={ocSpotRef} />
         </div>
       )}
 
@@ -1050,6 +1619,30 @@ export default function App() {
 
   const nubraLoggedIn = !!nubraSession;
   const hasSecret = !!nubraTotpSecret;
+
+  // ── Basket state (lifted to App so navbar can show it) ──────────────────
+  const [basketLegs, setBasketLegs] = useState<BasketLeg[]>([]);
+  const basketIdRef = useRef(0);
+  const [showBasket, setShowBasket] = useState(false);
+  const [domLegs, setDomLegs] = useState<BasketLeg[]>([]);
+  const [basketPos, setBasketPos] = useState<{ x: number; y: number } | null>(null);
+  const basketWrapperRef = useRef<HTMLDivElement>(null);
+  const basketDragRef = useRef<{ startX: number; startY: number; origX: number; origY: number } | null>(null);
+  const execBasketRef = useRef<((legs: BasketLeg[]) => void) | null>(null);
+  const basketBtnRef = useRef<HTMLButtonElement>(null);
+
+  const handleAddToBasket = useCallback((leg: BasketLeg) => {
+    setBasketLegs(prev => [...prev, { ...leg, id: ++basketIdRef.current }]);
+    setShowBasket(true);
+  }, []);
+
+  const handleExecuteBasket = useCallback(() => {
+    if (execBasketRef.current && basketLegs.length > 0) {
+      execBasketRef.current(basketLegs);
+    }
+    setBasketLegs([]);
+    setShowBasket(false);
+  }, [basketLegs]);
 
   const [showCookieInput, setShowCookieInput] = useState(false);
   const [cookieInput, setCookieInput] = useState(() => localStorage.getItem('nubra_raw_cookie') ?? '');
@@ -1458,6 +2051,23 @@ export default function App() {
               <span style={{ lineHeight: 0, flexShrink: 0, display: 'flex', alignItems: 'center', justifyContent: 'center', width: 26, height: 26, borderRadius: 6, background: page === 'mtm' ? 'rgba(79,142,247,0.25)' : 'rgba(255,255,255,0.08)', border: page === 'mtm' ? '1px solid rgba(79,142,247,0.55)' : '1px solid rgba(255,255,255,0.12)', color: page === 'mtm' ? '#7EB8FF' : '#C9D1DC', transition: 'background 0.15s, border-color 0.15s, color 0.15s' }}><IconTrendingUp /></span>
               <span style={{ lineHeight: 1 }}>Mtm Analyzer</span>
             </button>
+
+            {/* Basket icon button */}
+            <button
+              ref={basketBtnRef}
+              onClick={() => setShowBasket(b => !b)}
+              title="Basket Order"
+              style={{ position: 'relative', width: 36, height: 32, background: showBasket ? 'rgba(37,99,235,0.18)' : 'transparent', border: `1px solid ${showBasket ? 'rgba(37,99,235,0.5)' : 'transparent'}`, borderRadius: 7, display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer', transition: 'all 0.15s' }}
+              onMouseEnter={e => { if (!showBasket) (e.currentTarget as HTMLElement).style.background = 'rgba(255,255,255,0.07)'; }}
+              onMouseLeave={e => { if (!showBasket) (e.currentTarget as HTMLElement).style.background = 'transparent'; }}
+            >
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke={showBasket ? '#3b82f6' : '#9CA3AF'} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M6 2 3 6v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V6l-3-4z"/><line x1="3" y1="6" x2="21" y2="6"/><path d="M16 10a4 4 0 0 1-8 0"/>
+              </svg>
+              {basketLegs.length > 0 && (
+                <span style={{ position: 'absolute', top: 3, right: 3, minWidth: 14, height: 14, borderRadius: 7, background: '#2563eb', fontSize: 9, fontWeight: 800, color: '#fff', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '0 3px', lineHeight: 1 }}>{basketLegs.length}</span>
+              )}
+            </button>
           </div>
 
         </header>
@@ -1535,11 +2145,88 @@ export default function App() {
 
           {/* MTM Analyzer */}
           {(page === 'mtm' || visited.has('mtm')) && (
-            <MtmLayout visible={page === 'mtm'} workerRef={workerRef} workerReady={workerReady} workerModeRef={workerModeRef} mtmResultsCbRef={mtmSearchResultsCallbackRef} instruments={instruments} />
+            <MtmLayout visible={page === 'mtm'} workerRef={workerRef} workerReady={workerReady} workerModeRef={workerModeRef} mtmResultsCbRef={mtmSearchResultsCallbackRef} instruments={instruments} onAddToBasket={handleAddToBasket} execBasketRef={execBasketRef} />
           )}
 
         </main>
       </div>
+
+      {/* ── Basket Order (draggable) ───────────────────────────────── */}
+      {showBasket && (
+        <div
+          ref={basketWrapperRef}
+          style={{
+            position: 'fixed',
+            top: basketPos ? basketPos.y : 52,
+            left: basketPos ? basketPos.x : 'unset',
+            right: basketPos ? 'unset' : 16,
+            zIndex: 300,
+            display: 'flex',
+            alignItems: 'flex-start',
+            gap: 8,
+            willChange: 'transform',
+          }}
+        >
+          {/* DOM side panel — floats to the left of the basket */}
+          {domLegs.length > 0 && (
+            <DomSidePanel
+              legs={domLegs}
+              onClose={id => setDomLegs(prev => prev.filter(l => l.id !== id))}
+            />
+          )}
+          {/* Basket panel */}
+          <div style={{ width: 680, borderRadius: 10, boxShadow: '0 8px 40px rgba(0,0,0,0.7)', border: '1px solid rgba(255,255,255,0.1)', overflow: 'hidden', background: '#1a1a1a' }}>
+            {basketLegs.length === 0 ? (
+              <div style={{ padding: '32px 20px', textAlign: 'center', color: '#4B5563', fontSize: 13 }}>
+                No legs — click B or S in the Option Chain to add
+              </div>
+            ) : (
+              <BasketOrder
+                legs={basketLegs}
+                onRemove={id => { setBasketLegs(prev => prev.filter(l => l.id !== id)); setDomLegs(prev => prev.filter(l => l.id !== id)); }}
+                onUpdateLots={(id, lots) => setBasketLegs(prev => prev.map(l => l.id === id ? { ...l, lots } : l))}
+                onExecute={handleExecuteBasket}
+                onClear={() => { setBasketLegs([]); setShowBasket(false); setDomLegs([]); }}
+                domLegs={domLegs}
+                onDomToggle={leg => setDomLegs(prev => prev.some(d => d.id === leg.id) ? prev.filter(d => d.id !== leg.id) : [...prev, leg])}
+                onDragStart={e => {
+                  e.preventDefault();
+                  const el = basketWrapperRef.current;
+                  if (!el) return;
+                  // Snapshot current pixel position (works even on first drag from right:16)
+                  const rect = el.getBoundingClientRect();
+                  const startX = e.clientX;
+                  const startY = e.clientY;
+                  let curX = rect.left;
+                  let curY = rect.top;
+                  // Pin to left/top immediately so no jump
+                  el.style.right = 'unset';
+                  el.style.left = curX + 'px';
+                  el.style.top = curY + 'px';
+                  basketDragRef.current = { startX, startY, origX: curX, origY: curY };
+
+                  const onMove = (me: MouseEvent) => {
+                    if (!basketDragRef.current) return;
+                    curX = basketDragRef.current.origX + me.clientX - basketDragRef.current.startX;
+                    curY = basketDragRef.current.origY + me.clientY - basketDragRef.current.startY;
+                    // Direct DOM update — zero re-renders during drag
+                    el.style.left = curX + 'px';
+                    el.style.top = curY + 'px';
+                  };
+                  const onUp = () => {
+                    basketDragRef.current = null;
+                    setBasketPos({ x: curX, y: curY });
+                    window.removeEventListener('mousemove', onMove);
+                    window.removeEventListener('mouseup', onUp);
+                  };
+                  window.addEventListener('mousemove', onMove);
+                  window.addEventListener('mouseup', onUp);
+                }}
+              />
+            )}
+          </div>
+        </div>
+      )}
 
       {/* ── Chart Symbol Search Modal ─────────────────────────────── */}
       {showChartSearch && (
@@ -1670,8 +2357,8 @@ export default function App() {
 
             {/* Footer */}
             <div style={{ display: 'flex', alignItems: 'center', gap: 16, padding: '8px 20px', borderTop: '1px solid rgba(255,255,255,0.06)', background: 'rgba(0,0,0,0.2)' }}>
-              <span style={{ fontSize: 11, color: '#4A4E5C' }}><kbd style={{ fontFamily: 'monospace' }}>↵</kbd> select</span>
-              <span style={{ fontSize: 11, color: '#4A4E5C' }}><kbd style={{ fontFamily: 'monospace' }}>Esc</kbd> close</span>
+              <span style={{ fontSize: 11, color: '#4A4E5C' }}><kbd style={{ fontFamily: '-apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif' }}>↵</kbd> select</span>
+              <span style={{ fontSize: 11, color: '#4A4E5C' }}><kbd style={{ fontFamily: '-apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif' }}>Esc</kbd> close</span>
             </div>
           </div>
         </div>

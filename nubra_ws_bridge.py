@@ -6,16 +6,16 @@ Nubra WebSocket Bridge Server
 - Re-broadcasts clean JSON to frontend clients on ws://localhost:8765
 
 Subscription protocol (frontend → bridge):
-  { "action": "subscribe", "session_token": "...", "data_type": "ohlcv"|"greeks",
+  { "action": "subscribe", "session_token": "...", "data_type": "ohlcv"|"greeks"|"index"|"option"|"orderbook",
     "symbols": ["NIFTY"], "ref_ids": [1058227], "interval": "3", "exchange": "NSE" }
   { "action": "unsubscribe", ... }
 
 Messages sent to frontend:
-  { "type": "ohlcv", "data": { "indexname": "NIFTY", "open": 123.45, "high": ..., "low": ...,
-      "close": ..., "bucket_volume": ..., "cumulative_volume": ...,
-      "timestamp": 1234567890, "bucket_timestamp": 1234567890, "interval": "1m" } }
-  { "type": "greeks", "data": { "ref_id": 1058227, "delta": ..., "theta": ...,
-      "gamma": ..., "vega": ..., "iv": ..., "ltp": ..., "timestamp": ... } }
+  { "type": "ohlcv",      "data": { ... } }
+  { "type": "greeks",     "data": { "ref_id": 1058227, "delta": ..., "ltp": ..., ... } }
+  { "type": "orderbook",  "data": { "ref_id": ..., "last_traded_price": ...,
+      "bids": [{"price": ..., "quantity": ..., "num_orders": ...}, ...],
+      "asks": [...] } }
   { "type": "connected" }
   { "type": "error", "message": "..." }
 """
@@ -35,6 +35,7 @@ try:
 except ImportError:
     print("ERROR: nubra_python_sdk not installed. Run: pip install nubra-sdk", file=sys.stderr)
     sys.exit(1)
+
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [bridge] %(message)s")
 log = logging.getLogger("nubra_bridge")
@@ -105,6 +106,14 @@ class NubraBridge:
         ref_ids = msg.get("ref_ids", [])
         interval = msg.get("interval", "1m")  # string like "1m", "5m", "1d"
 
+        if data_type == "orderbook":
+            # Uses the same existing Nubra WS connection — session_token is the bearer token
+            payload = {"instruments": [int(r) for r in ref_ids], "indexes": []}
+            sub_msg = f"batch_subscribe {self.session_token} orderbook {json.dumps(payload, separators=(',', ':'))}"
+            log.info(f"Subscribing orderbook: {sub_msg[:120]}")
+            await self.nubra_ws.send_str(sub_msg)
+            return
+
         if data_type == "ohlcv":
             payload = {"instruments": [], "indexes": symbols}
             sub_msg = f"batch_subscribe {self.session_token} index_bucket {json.dumps(payload, separators=(',', ':'))} {interval} {exchange}"
@@ -115,8 +124,6 @@ class NubraBridge:
             payload = {"instruments": [], "indexes": symbols}
             sub_msg = f"batch_subscribe {self.session_token} index {json.dumps(payload, separators=(',', ':'))} {exchange}"
         elif data_type == "option":
-            # symbols: ["NIFTY:20250626", "NIFTY:20250703", ...]
-            # exchange: "NSE"
             chain_list = []
             for s in symbols:
                 parts = s.split(":")
@@ -207,6 +214,23 @@ class NubraBridge:
                             "tick_volume": obj.tick_volume,
                             "cumulative_volume": obj.cumulative_volume,
                             "bucket_timestamp": obj.bucket_timestamp,
+                        }
+                    })
+
+            elif inner.type_url.endswith("BatchWebSocketOrderbookMessage"):
+                msg = nubrafrontend_pb2.BatchWebSocketOrderbookMessage()
+                inner.Unpack(msg)
+                for obj in msg.instruments:
+                    await self._send_json({
+                        "type": "orderbook",
+                        "data": {
+                            "ref_id": obj.ref_id,
+                            "timestamp": obj.timestamp,
+                            "last_traded_price": obj.ltp,
+                            "last_traded_quantity": obj.ltq,
+                            "volume": obj.volume,
+                            "bids": [{"price": b.price, "quantity": b.quantity, "num_orders": b.orders} for b in obj.bids],
+                            "asks": [{"price": a.price, "quantity": a.quantity, "num_orders": a.orders} for a in obj.asks],
                         }
                     })
 

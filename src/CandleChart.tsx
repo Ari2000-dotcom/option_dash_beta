@@ -538,7 +538,6 @@ function OptionChainPanel({
 }) {
   const underlying = instrument.underlying_symbol || instrument.trading_symbol;
 
-  // Build sorted expiry list once instruments are loaded
   const expiries = useMemo(() => {
     if (!underlying || !instruments.length) return [];
     const today = Date.now();
@@ -549,7 +548,6 @@ function OptionChainPanel({
     )].sort((a, b) => a - b);
   }, [underlying, instruments]);
 
-  // Auto-select nearest expiry when list loads
   const [selectedExpiry, setSelectedExpiry] = useState<number | null>(null);
   useEffect(() => {
     if (expiries.length > 0 && (selectedExpiry === null || !expiries.includes(selectedExpiry))) {
@@ -560,6 +558,7 @@ function OptionChainPanel({
   const { rows, mdMap } = useOptionChain(instrument, instruments, open, selectedExpiry);
 
   const [metric, setMetric] = useState<OcMetric>('ltp');
+  const [settingsOpen, setSettingsOpen] = useState(false);
 
   function getMetricValue(key: string | null, m: OcMetric): string {
     if (!key) return '—';
@@ -579,28 +578,22 @@ function OptionChainPanel({
     }
   }
 
-  // Find the underlying spot instrument key (INDEX/EQ) for FUT/CE/PE contracts
   const spotInstrumentKey = useMemo(() => {
     const t = instrument.instrument_type;
     if (t === 'INDEX' || t === 'EQ') return instrument.instrument_key;
-    // For FUT/CE/PE: find the INDEX or EQ instrument whose trading_symbol matches underlying_symbol
     const u = instrument.underlying_symbol;
     if (!u || !instruments.length) return instrument.instrument_key;
     const found = instruments.find(i => (i.instrument_type === 'INDEX' || i.instrument_type === 'EQ') && i.trading_symbol === u);
     return found?.instrument_key ?? instrument.instrument_key;
   }, [instrument.instrument_key, instrument.instrument_type, instrument.underlying_symbol, instruments]);
 
-  // Live spot price — subscribe to underlying INDEX/EQ
   const [spot, setSpot] = useState(() => wsManager.get(spotInstrumentKey)?.ltp ?? 0);
   useEffect(() => {
     setSpot(wsManager.get(spotInstrumentKey)?.ltp ?? 0);
     wsManager.requestKeys([spotInstrumentKey]);
-    return wsManager.subscribe(spotInstrumentKey, md => {
-      if (md.ltp) setSpot(md.ltp);
-    });
+    return wsManager.subscribe(spotInstrumentKey, md => { if (md.ltp) setSpot(md.ltp); });
   }, [spotInstrumentKey]);
 
-  // ATM strike
   const atmStrike = rows.length && spot
     ? rows.reduce((best, r) => Math.abs(r.strike - spot) < Math.abs(best - spot) ? r.strike : best, rows[0].strike)
     : null;
@@ -609,118 +602,169 @@ function OptionChainPanel({
   const panelRef = useRef<HTMLDivElement>(null);
   const [panelWidth, setPanelWidth] = useState(290);
   const dragRef = useRef({ dragging: false, startX: 0, startW: 0 });
+  const atmRowRef = useRef<HTMLTableRowElement>(null);
+  const shouldScrollToAtm = useRef(true);
 
-  // Clamp helpers
-  const MIN_W = 200, MAX_W = 480;
+  // Scroll to ATM once on open/expiry change
+  useEffect(() => { shouldScrollToAtm.current = true; }, [selectedExpiry, open]);
+  useEffect(() => {
+    if (rows.length === 0 || !shouldScrollToAtm.current || !atmRowRef.current) return;
+    shouldScrollToAtm.current = false;
+    requestAnimationFrame(() => atmRowRef.current?.scrollIntoView({ block: 'center', behavior: 'smooth' }));
+  }, [rows]);
 
   const onResizePointerDown = useCallback((e: React.PointerEvent) => {
     e.preventDefault();
     e.currentTarget.setPointerCapture(e.pointerId);
     dragRef.current = { dragging: true, startX: e.clientX, startW: panelWidth };
-
     const onMove = (me: PointerEvent) => {
-      const delta = dragRef.current.startX - me.clientX; // drag left = grow
-      const next = Math.min(MAX_W, Math.max(MIN_W, dragRef.current.startW + delta));
-      setPanelWidth(next);
+      const delta = dragRef.current.startX - me.clientX;
+      setPanelWidth(Math.min(600, Math.max(220, dragRef.current.startW + delta)));
     };
-    const onUp = () => {
-      dragRef.current.dragging = false;
-      document.removeEventListener('pointermove', onMove);
-      document.removeEventListener('pointerup', onUp);
-    };
+    const onUp = () => { dragRef.current.dragging = false; document.removeEventListener('pointermove', onMove); document.removeEventListener('pointerup', onUp); };
     document.addEventListener('pointermove', onMove);
     document.addEventListener('pointerup', onUp);
   }, [panelWidth]);
 
-  // Font scale: 1.0 at 290px, scales linearly with width
-  const scale = Math.max(0.78, Math.min(1.22, panelWidth / 290));
-  const fs = (base: number) => Math.round(base * scale * 10) / 10;
-  // Strike column width scales too
-  const strikeColW = Math.round(76 * scale);
+  const curMetricLabel = OC_METRICS.find(m => m.id === metric)?.label ?? metric.toUpperCase();
 
   if (!open) return null;
 
   return (
     <div
       ref={panelRef}
-      className="flex flex-col h-full overflow-hidden"
-      style={{ width: panelWidth, background: '#171717', borderLeft: '1px solid rgba(255,255,255,0.06)', flexShrink: 0, position: 'relative' }}
+      style={{ width: panelWidth, background: '#1d1a17', borderLeft: '1px solid rgba(255,255,255,0.06)', flexShrink: 0, position: 'relative', display: 'flex', flexDirection: 'column', height: '100%', color: '#D1D5DB' }}
     >
-      {/* Resize handle — left edge, double-click resets to default */}
+      <style>{`
+        .ocp-tbody tr.ocp-row:hover td { background: rgba(255,255,255,0.03); }
+        .ocp-tbody tr.ocp-row-atm td { background: rgba(224,168,0,0.04); }
+        .ocp-tbody tr.ocp-row-atm:hover td { background: rgba(224,168,0,0.08); }
+        .ocp-tbody tr.ocp-row-odd td { background: transparent; }
+        .ocp-tbody tr.ocp-row-even td { background: rgba(255,255,255,0.015); }
+        .ocp-gear:hover { background: rgba(255,255,255,0.1) !important; }
+      `}</style>
+
+      {/* Resize handle */}
       <div
         onPointerDown={onResizePointerDown}
         onDoubleClick={() => setPanelWidth(290)}
-        style={{
-          position: 'absolute', left: 0, top: 0, bottom: 0, width: 4,
-          cursor: 'col-resize', zIndex: 20,
-          background: 'transparent',
-          transition: 'background 0.15s',
-        }}
+        style={{ position: 'absolute', left: 0, top: 0, bottom: 0, width: 4, cursor: 'col-resize', zIndex: 20, background: 'transparent', transition: 'background 0.15s' }}
         onMouseEnter={e => { (e.currentTarget as HTMLDivElement).style.background = 'rgba(79,142,247,0.45)'; }}
         onMouseLeave={e => { (e.currentTarget as HTMLDivElement).style.background = 'transparent'; }}
       />
 
-      {/* Header: symbol + spot + metric dropdown + expiry dropdown */}
-      <div style={{ height: 42, flexShrink: 0, display: 'flex', alignItems: 'center', gap: Math.round(4 * scale), padding: `0 ${Math.round(10 * scale)}px`, borderBottom: '1px solid rgba(255,255,255,0.06)', overflow: 'hidden' }}>
-        <span style={{ fontSize: fs(10), fontWeight: 800, letterSpacing: '0.12em', color: '#FF9800', textTransform: 'uppercase', flexShrink: 0 }}>OC</span>
-        <span style={{ fontSize: fs(12), fontWeight: 600, color: '#9B9EA8', letterSpacing: '0.05em', flexShrink: 0, maxWidth: Math.round(80 * scale), overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{underlying}</span>
-        {spot > 0 && panelWidth > 230 && (
-          <span style={{ fontSize: fs(13), fontWeight: 700, color: '#E0E3EB', fontFamily: '"SF Mono","Fira Code",monospace', letterSpacing: '0.02em', flexShrink: 0 }}>
-            {spot.toFixed(2)}
-          </span>
-        )}
-        <div style={{ marginLeft: 'auto', display: 'flex', gap: 4, alignItems: 'center', flexShrink: 0 }}>
-          <MetricDropdown value={metric} onChange={setMetric} metrics={OC_METRICS} />
-          <ExpiryDropdown expiries={expiries} selected={selectedExpiry} onChange={setSelectedExpiry} />
+      {/* Metric picker modal */}
+      {settingsOpen && (
+        <div onClick={() => setSettingsOpen(false)} style={{ position: 'absolute', inset: 0, zIndex: 50, backdropFilter: 'blur(6px)', background: 'rgba(0,0,0,0.55)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+          <div onClick={e => e.stopPropagation()} style={{ background: '#1f1f1f', border: '1px solid rgba(255,255,255,0.1)', borderRadius: 12, width: 240, padding: '18px 20px', boxShadow: '0 20px 60px rgba(0,0,0,0.6)' }}>
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 14 }}>
+              <span style={{ fontSize: 13, fontWeight: 700, color: '#E2E8F0' }}>Choose Metric</span>
+              <button onClick={() => setSettingsOpen(false)} style={{ background: 'transparent', border: 'none', cursor: 'pointer', color: '#6b7280', display: 'flex', padding: 2 }}>
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round"><path d="M18 6 6 18M6 6l12 12"/></svg>
+              </button>
+            </div>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+              {OC_METRICS.map(m => (
+                <button key={m.id} onClick={() => { setMetric(m.id); setSettingsOpen(false); }} style={{
+                  display: 'flex', alignItems: 'center', gap: 10, padding: '8px 10px', borderRadius: 7, border: 'none', cursor: 'pointer', textAlign: 'left',
+                  background: metric === m.id ? 'rgba(249,115,22,0.15)' : 'transparent',
+                  color: metric === m.id ? '#f97316' : '#9CA3AF',
+                }}>
+                  <div style={{ width: 14, height: 14, borderRadius: 3, flexShrink: 0, background: metric === m.id ? '#f97316' : 'transparent', border: `1.5px solid ${metric === m.id ? '#f97316' : 'rgba(255,255,255,0.2)'}`, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                    {metric === m.id && <svg width="8" height="6" viewBox="0 0 9 7" fill="none"><path d="M1 3.5L3.5 6L8 1" stroke="white" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/></svg>}
+                  </div>
+                  <span style={{ fontSize: 13, fontWeight: 500 }}>{m.label}</span>
+                  <span style={{ fontSize: 11, color: '#4B5563', marginLeft: 'auto' }}>{m.desc}</span>
+                </button>
+              ))}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Header */}
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '10px 14px', borderBottom: '1px solid rgba(255,255,255,0.06)', flexShrink: 0, background: '#1d1a17' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+          <span style={{ fontSize: 13, fontWeight: 800, color: '#E2E8F0', letterSpacing: '0.04em' }}>{underlying}</span>
+          {spot > 0 && (
+            <span style={{ fontSize: 12, fontWeight: 700, color: '#4F8EF7', background: 'rgba(79,142,247,0.1)', padding: '3px 8px', borderRadius: 6, border: '1px solid rgba(79,142,247,0.2)' }}>
+              {spot.toFixed(2)}
+            </span>
+          )}
+        </div>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+          {/* Active metric badge */}
+          <span style={{ fontSize: 11, fontWeight: 700, color: '#FF9800', background: 'rgba(255,152,0,0.1)', padding: '2px 8px', borderRadius: 5, border: '1px solid rgba(255,152,0,0.2)', letterSpacing: '0.04em' }}>{curMetricLabel}</span>
+          {/* Gear — opens metric picker */}
+          <button className="ocp-gear" onClick={() => setSettingsOpen(true)} title="Choose metric"
+            style={{ background: 'rgba(255,255,255,0.06)', border: '1px solid rgba(255,255,255,0.1)', borderRadius: 6, cursor: 'pointer', color: '#817E7E', display: 'flex', alignItems: 'center', justifyContent: 'center', width: 24, height: 24, transition: 'background 0.15s' }}>
+            <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 13.648 13.648" fill="currentColor">
+              <path fillRule="evenodd" clipRule="evenodd" d="M5.09373 0.995125C5.16241 0.427836 5.64541 0 6.21747 0H7.43151C8.0039 0 8.48663 0.428191 8.55525 0.996829C8.5553 0.997248 8.55536 0.997666 8.5554 0.9981L8.65947 1.81525C8.80015 1.86677 8.93789 1.92381 9.07227 1.98601L9.72415 1.47911C10.1776 1.12819 10.8237 1.16381 11.2251 1.57622L12.0753 2.42643C12.4854 2.82551 12.5214 3.47159 12.1697 3.92431L11.6628 4.57692C11.725 4.71124 11.782 4.84882 11.8335 4.98924L12.6526 5.09337C12.653 5.09342 12.6534 5.09348 12.6539 5.09352C13.2211 5.16221 13.6492 5.64522 13.6484 6.21766V7.4312C13.6484 8.00358 13.2203 8.48622 12.6517 8.5549C12.6513 8.55496 12.6508 8.55502 12.6503 8.55506L11.8338 8.65909C11.7824 8.7996 11.7254 8.93729 11.663 9.07168L12.1696 9.72354C12.5218 10.1776 12.4847 10.823 12.0728 11.2245L11.2224 12.0749C10.8233 12.485 10.1772 12.5209 9.72452 12.1692L9.07187 11.6624C8.93756 11.7246 8.79995 11.7815 8.65952 11.833L8.55539 12.6521C8.55533 12.6525 8.55528 12.653 8.55522 12.6534C8.48652 13.2206 8.00353 13.6484 7.43151 13.6484H6.21747C5.64485 13.6484 5.16232 13.22 5.09373 12.6506C5.09367 12.6501 5.09361 12.6496 5.09355 12.6491L4.98954 11.8328C4.84901 11.7814 4.71133 11.7244 4.57692 11.662L3.92477 12.1688C3.47111 12.5199 2.82587 12.4838 2.42408 12.0724L1.57358 11.2219C1.16354 10.8229 1.12761 10.1769 1.47927 9.72417L1.98614 9.0715C1.92397 8.93721 1.86696 8.7996 1.81546 8.65919L0.996348 8.55505C0.995929 8.555 0.995526 8.55494 0.995107 8.5549C0.427838 8.48619 0 8.00325 0 7.4312V6.21724C0 5.64481 0.428228 5.16211 0.996871 5.09351L1.81538 4.98929C1.86677 4.84897 1.92362 4.7113 1.98597 4.5768L1.47915 3.92465C1.12701 3.47063 1.1643 2.82485 1.57625 2.42329L2.42671 1.57338C2.82634 1.16348 3.47226 1.12815 3.92438 1.4792L4.57644 1.98589C4.71105 1.92352 4.84888 1.86662 4.98946 1.81519L5.09373 0.995125ZM6.82448 4.43525C5.50742 4.43525 4.43541 5.50723 4.43541 6.82422C4.43541 8.14119 5.50742 9.21317 6.82448 9.21317C8.14154 9.21317 9.21356 8.14119 9.21356 6.82422C9.21356 5.50723 8.14154 4.43525 6.82448 4.43525ZM3.79381 6.82422C3.79381 5.15287 5.15311 3.79365 6.82448 3.79365C8.49586 3.79365 9.85515 5.15287 9.85515 6.82422C9.85515 8.49556 8.49586 9.85477 6.82448 9.85477C5.15311 9.85477 3.79381 8.49556 3.79381 6.82422Z" />
+            </svg>
+          </button>
         </div>
       </div>
 
-      {/* Column headers */}
-      <div style={{
-        display: 'grid', gridTemplateColumns: `1fr ${strikeColW}px 1fr`,
-        padding: `0 ${Math.round(12 * scale)}px`, height: 28,
-        alignItems: 'center',
-        borderBottom: '1px solid rgba(255,255,255,0.06)',
-        background: 'rgba(255,255,255,0.02)',
-      }}>
-        <span style={{ fontSize: fs(10), fontWeight: 700, letterSpacing: '0.10em', color: '#2ebd85' }}>CALL</span>
-        <span style={{ fontSize: fs(10), fontWeight: 700, letterSpacing: '0.10em', color: '#5D606B', textAlign: 'center' }}>STRIKE</span>
-        <span style={{ fontSize: fs(10), fontWeight: 700, letterSpacing: '0.10em', color: '#f23645', textAlign: 'right' }}>PUT</span>
+      {/* Expiry row */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '7px 14px', borderBottom: '1px solid rgba(255,255,255,0.03)', flexShrink: 0 }}>
+        <span style={{ fontSize: 10, color: '#6B7280', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.04em', flexShrink: 0 }}>Expiry</span>
+        <ExpiryDropdown expiries={expiries} selected={selectedExpiry} onChange={v => { setSelectedExpiry(v); shouldScrollToAtm.current = true; }} />
       </div>
 
-      {/* Rows */}
-      <div className="overflow-y-auto flex-1" style={{ scrollbarWidth: 'thin', scrollbarColor: '#1f1f1f transparent' } as React.CSSProperties}>
+      {/* Table */}
+      <div style={{ flex: 1, overflowY: 'auto', overflowX: 'auto', scrollbarWidth: 'thin', scrollbarColor: '#2a2a2a transparent' }}>
         {rows.length === 0 ? (
-          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: 80, fontSize: fs(11), color: '#3D4150', letterSpacing: '0.08em' }}>
+          <div style={{ padding: '60px', textAlign: 'center', fontSize: 12, color: '#3D4150' }}>
             {instruments.length === 0 ? 'Loading…' : selectedExpiry ? 'No options found' : 'Select expiry'}
           </div>
-        ) : rows.map(row => {
-          const ceVal = getMetricValue(row.ceKey, metric);
-          const peVal = getMetricValue(row.peKey, metric);
-          const isAtm = row.strike === atmStrike;
-          return (
-            <div
-              key={row.strike}
-              style={{
-                display: 'grid', gridTemplateColumns: `1fr ${strikeColW}px 1fr`,
-                padding: `${Math.round(5 * scale)}px ${Math.round(12 * scale)}px`,
-                borderBottom: '1px solid rgba(255,255,255,0.03)',
-                background: isAtm ? 'rgba(255,152,0,0.07)' : 'transparent',
-                transition: 'background 0.1s',
-              }}
-            >
-              <span style={{ fontSize: fs(12), fontWeight: 600, color: ceVal !== '—' ? '#2ebd85' : '#2a2a2a', fontFamily: '"SF Mono","Fira Code",monospace' }}>
-                {ceVal}
-              </span>
-              <span style={{ fontSize: fs(11), fontWeight: 700, color: isAtm ? '#FF9800' : '#8B8E98', textAlign: 'center', letterSpacing: '0.01em' }}>
-                {row.strike % 1 === 0 ? row.strike.toFixed(0) : row.strike.toFixed(2)}
-              </span>
-              <span style={{ fontSize: fs(12), fontWeight: 600, color: peVal !== '—' ? '#f23645' : '#2a2a2a', textAlign: 'right', fontFamily: '"SF Mono","Fira Code",monospace' }}>
-                {peVal}
-              </span>
-            </div>
-          );
-        })}
+        ) : (
+          <table style={{ width: '100%', borderCollapse: 'collapse', tableLayout: 'fixed' }}>
+            <thead style={{ position: 'sticky', top: 0, zIndex: 3, background: '#1d1a17' }}>
+              <tr style={{ borderBottom: '1px solid rgba(255,255,255,0.04)' }}>
+                <th style={{ textAlign: 'center', padding: '8px 0', fontSize: 12, fontWeight: 800, color: '#e0a800', letterSpacing: '0.08em', background: '#333333' }}>Call</th>
+                <th style={{ textAlign: 'center', padding: '8px 0', fontSize: 11, fontWeight: 700, color: '#9CA3AF', background: '#333333', width: 72 }}>Strike</th>
+                <th style={{ textAlign: 'center', padding: '8px 0', fontSize: 12, fontWeight: 800, color: '#818cf8', letterSpacing: '0.08em', background: '#333333' }}>Put</th>
+              </tr>
+              <tr style={{ borderBottom: '1px solid rgba(255,255,255,0.08)' }}>
+                <th style={{ padding: '6px 10px', fontSize: 10, fontWeight: 700, color: '#9CA3AF', textAlign: 'right', textTransform: 'uppercase', letterSpacing: '0.04em', background: 'rgba(224,168,0,0.02)' }}>{curMetricLabel}</th>
+                <th style={{ padding: '6px 10px', fontSize: 10, fontWeight: 700, color: '#9CA3AF', textAlign: 'center', textTransform: 'uppercase', letterSpacing: '0.04em', background: '#333333', width: 72 }}>Strike</th>
+                <th style={{ padding: '6px 10px', fontSize: 10, fontWeight: 700, color: '#9CA3AF', textAlign: 'left', textTransform: 'uppercase', letterSpacing: '0.04em', background: 'rgba(129,140,248,0.02)' }}>{curMetricLabel}</th>
+              </tr>
+            </thead>
+            <tbody className="ocp-tbody">
+              {rows.map((row, ri) => {
+                const ceVal = getMetricValue(row.ceKey, metric);
+                const peVal = getMetricValue(row.peKey, metric);
+                const isAtm = row.strike === atmStrike;
+                const prevRow = rows[ri - 1];
+                const showAtmLine = isAtm && prevRow && prevRow.strike !== atmStrike;
+                const isCeItm = spot > 0 && row.strike < spot;
+                const isPeItm = spot > 0 && row.strike > spot;
+                return (
+                  <tr key={row.strike}
+                    ref={isAtm ? atmRowRef : undefined}
+                    className={`ocp-row ${isAtm ? 'ocp-row-atm' : ri % 2 === 0 ? 'ocp-row-even' : 'ocp-row-odd'}`}
+                    style={{ borderBottom: showAtmLine ? '1px dashed rgba(224,168,0,0.4)' : '1px solid rgba(255,255,255,0.06)' }}
+                  >
+                    <td style={{
+                      padding: '7px 10px', fontSize: 12, fontWeight: 600, textAlign: 'right', whiteSpace: 'nowrap',
+                      color: ceVal !== '—' ? '#2ebd85' : '#3D4150',
+                      background: isCeItm ? 'rgba(0,168,132,0.18)' : undefined,
+                    }}>{ceVal}</td>
+                    <td style={{ padding: '7px 10px', fontSize: 12, fontWeight: 700, textAlign: 'center', whiteSpace: 'nowrap', background: '#333333', color: isAtm ? '#e0a800' : '#C0C0C0', width: 72 }}>
+                      {row.strike % 1 === 0 ? row.strike.toFixed(0) : row.strike.toFixed(2)}
+                    </td>
+                    <td style={{
+                      padding: '7px 10px', fontSize: 12, fontWeight: 600, textAlign: 'left', whiteSpace: 'nowrap',
+                      color: peVal !== '—' ? '#f23645' : '#3D4150',
+                      background: isPeItm ? 'rgba(210,130,0,0.28)' : undefined,
+                    }}>{peVal}</td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        )}
       </div>
     </div>
   );
