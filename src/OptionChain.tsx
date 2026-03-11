@@ -4,7 +4,7 @@
  * On open: scrolls to ATM ±10 strikes.
  */
 
-import React, { useState, useEffect, useRef, useMemo } from 'react';
+import React, { useState, useEffect, useRef, useMemo, startTransition } from 'react';
 import {
   useReactTable,
   getCoreRowModel,
@@ -96,9 +96,11 @@ interface AddLegPayload {
   refId?: number;
   instrumentKey?: string;
   greeks: { delta: number; theta: number; vega: number; gamma: number; iv: number };
+  entryDate?: string;
+  entryTime?: string;
 }
 
-function OptionChainNubra({ symbol, expiries, sessionToken, exchange = 'NSE', onClose, onAddLeg, onLtpUpdateRef, lotSize = 1 }: {
+function OptionChainNubra({ symbol, expiries, sessionToken, exchange = 'NSE', onClose, onAddLeg, onLtpUpdateRef, lotSize = 1, isHistoricalMode }: {
   symbol: string;
   expiries: (string | number)[];
   sessionToken: string;
@@ -107,12 +109,16 @@ function OptionChainNubra({ symbol, expiries, sessionToken, exchange = 'NSE', on
   onAddLeg?: (leg: AddLegPayload) => void;
   onLtpUpdateRef?: React.MutableRefObject<((ltpMap: Map<number, { ce: number; pe: number; ceGreeks: { delta: number; theta: number; vega: number; gamma: number; iv: number }; peGreeks: { delta: number; theta: number; vega: number; gamma: number; iv: number } }>, spot: number, expiry: string) => void) | null>;
   lotSize?: number;
+  isHistoricalMode?: boolean;
 }) {
   const [selectedExpiry, setSelectedExpiry] = useState<string | null>(null);
   const [rows, setRows] = useState<OptionRow[]>([]);
   const [spot, setSpot] = useState(0);
   const [qty, setQty] = useState(1);
-  const [popup, setPopup] = useState<{ x: number; y: number; strike: number; type: 'CE' | 'PE'; action: 'B' | 'S'; price: number; refId?: number; greeks: { delta: number; theta: number; vega: number; gamma: number; iv: number } } | null>(null);
+  const [entryDate, setEntryDate] = useState(() => { const d = new Date(); if (d.getHours() < 9 || (d.getHours() === 9 && d.getMinutes() < 15)) { d.setDate(d.getDate() - 1); } return d.toISOString().slice(0, 10); });
+  const [entryTime, setEntryTime] = useState('09:15');
+  const [popup, setPopup] = useState<{ x: number; y: number; strike: number; type: 'CE' | 'PE'; action: 'B' | 'S'; price: number; refId?: number; greeks: { delta: number; theta: number; vega: number; gamma: number; iv: number }; instrumentKey?: string | null; expiry?: string; } | null>(null);
+  const openPopup = (p: NonNullable<typeof popup>) => startTransition(() => { setQty(1); setPopup(p); });
   const popupRef = useRef<HTMLDivElement>(null);
   const [atm, setAtm] = useState(0);
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -123,6 +129,31 @@ function OptionChainNubra({ symbol, expiries, sessionToken, exchange = 'NSE', on
   const tbodyRef = useRef<HTMLTableSectionElement>(null);
   const atmRowRef = useRef<HTMLTableRowElement>(null);
   const shouldScrollToAtm = useRef(true);
+
+  const ceOverlayRef = useRef<HTMLDivElement>(null);
+  const peOverlayRef = useRef<HTMLDivElement>(null);
+  const overlayDataRef = useRef<{ strike: number; ceLtp: number; peLtp: number; ceRefId?: number; peRefId?: number; ceGreeks: any; peGreeks: any; } | null>(null);
+
+  const showOverlay = (fixedTop: number, ceFixedLeft: number, peFixedLeft: number, cellW: number, cellH: number, data: NonNullable<typeof overlayDataRef.current>, side?: 'CE' | 'PE') => {
+    overlayDataRef.current = data;
+    const ce = ceOverlayRef.current;
+    const pe = peOverlayRef.current;
+    if (ce) { 
+      if (side === 'CE' || !side) {
+        ce.style.left = ceFixedLeft + 'px'; ce.style.top = fixedTop + 'px'; ce.style.width = cellW + 'px'; ce.style.height = cellH + 'px'; ce.style.display = 'flex'; 
+      } else ce.style.display = 'none';
+    }
+    if (pe) { 
+      if (side === 'PE' || !side) {
+        pe.style.left = peFixedLeft + 'px'; pe.style.top = fixedTop + 'px'; pe.style.width = cellW + 'px'; pe.style.height = cellH + 'px'; pe.style.display = 'flex'; 
+      } else pe.style.display = 'none';
+    }
+  };
+  const hideOverlay = () => {
+    const ce = ceOverlayRef.current; const pe = peOverlayRef.current;
+    if (ce) ce.style.display = 'none';
+    if (pe) pe.style.display = 'none';
+  };
 
   // Dismiss popup on outside click
   useEffect(() => {
@@ -623,6 +654,32 @@ function OptionChainNubra({ symbol, expiries, sessionToken, exchange = 'NSE', on
                       className={`oc-row ${data.isAtm ? 'oc-row-atm' : ri % 2 === 0 ? 'oc-row-even' : 'oc-row-odd'}`}
                       ref={data.isAtm ? atmRowRef : undefined}
                       style={{ borderBottom: '1px solid rgba(255,255,255,0.10)' }}
+                      onMouseEnter={e => {
+                        if (popup) return;
+                        const tr = e.currentTarget;
+                        const rct = tr.getBoundingClientRect();
+                        const strikeCell = tr.querySelector('.oc-strike-cell');
+                        const strikeCenter = strikeCell ? (strikeCell.getBoundingClientRect().left + strikeCell.getBoundingClientRect().right) / 2 : rct.left + rct.width / 2;
+                        const side = e.clientX < strikeCenter ? 'CE' : 'PE';
+                        showOverlay(rct.top, rct.left + 54, rct.right - 128 - 54, rct.width / 2 - 40, rct.height, {
+                          strike: data.strike, ceLtp: data.ce.ltp, peLtp: data.pe.ltp, ceRefId: data.ce.ref_id ?? 0, peRefId: data.pe.ref_id ?? 0,
+                          ceGreeks: { delta: data.ce.delta, theta: data.ce.theta, vega: data.ce.vega, gamma: data.ce.gamma, iv: data.ce.iv },
+                          peGreeks: { delta: data.pe.delta, theta: data.pe.theta, vega: data.pe.vega, gamma: data.pe.gamma, iv: data.pe.iv }
+                        }, side);
+                      }}
+                      onMouseMove={e => {
+                        if (popup) return;
+                        const tr = e.currentTarget;
+                        const rct = tr.getBoundingClientRect();
+                        const strikeCell = tr.querySelector('.oc-strike-cell');
+                        const strikeCenter = strikeCell ? (strikeCell.getBoundingClientRect().left + strikeCell.getBoundingClientRect().right) / 2 : rct.left + rct.width / 2;
+                        const side = e.clientX < strikeCenter ? 'CE' : 'PE';
+                        showOverlay(rct.top, rct.left + 54, rct.right - 128 - 54, rct.width / 2 - 40, rct.height, {
+                          strike: data.strike, ceLtp: data.ce.ltp, peLtp: data.pe.ltp, ceRefId: data.ce.ref_id ?? 0, peRefId: data.pe.ref_id ?? 0,
+                          ceGreeks: { delta: data.ce.delta, theta: data.ce.theta, vega: data.ce.vega, gamma: data.ce.gamma, iv: data.ce.iv },
+                          peGreeks: { delta: data.pe.delta, theta: data.pe.theta, vega: data.pe.vega, gamma: data.pe.gamma, iv: data.pe.iv }
+                        }, side);
+                      }}
                     >
                       {row.getVisibleCells().map(cell => {
                         const id = cell.column.id;
@@ -635,7 +692,7 @@ function OptionChainNubra({ symbol, expiries, sessionToken, exchange = 'NSE', on
                           ? 'rgba(210,130,0,0.28)'      // Bloomberg amber/orange — PE ITM
                           : undefined;
                         return (
-                          <td key={cell.id} style={{
+                          <td key={cell.id} className={isStrike ? 'oc-strike-cell' : ''} style={{
                             width: W[id], minWidth: W[id], padding: '8px 10px',
                             fontSize: 13, fontWeight: id==='strike' ? 700 : 500, fontFamily: '-apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif',
                             textAlign: isStrike ? 'center' : isCe ? 'right' : 'left',
@@ -653,6 +710,17 @@ function OptionChainNubra({ symbol, expiries, sessionToken, exchange = 'NSE', on
             </tbody>
           </table>
         )}
+      </div>
+
+      <div ref={ceOverlayRef} className="oc-bs-overlay" style={{ display: 'none', position: 'fixed', left: 0, top: 0 }}
+        onMouseLeave={e => { const rel = e.relatedTarget as HTMLElement | null; if (typeof rel?.closest === 'function' && (rel.closest('.oc-row') || rel.closest('.oc-bs-overlay'))) return; hideOverlay(); }}>
+        <button className="oc-btn oc-btn-b" onMouseDown={e => { e.stopPropagation(); const d = overlayDataRef.current; if (!d) return; const r = (e.target as HTMLElement).getBoundingClientRect(); hideOverlay(); openPopup({ x: r.left + r.width / 2, y: r.bottom + 6, strike: d.strike, type: 'CE', action: 'B', price: d.ceLtp, refId: d.ceRefId, greeks: d.ceGreeks }); }}>B</button>
+        <button className="oc-btn oc-btn-s" onMouseDown={e => { e.stopPropagation(); const d = overlayDataRef.current; if (!d) return; const r = (e.target as HTMLElement).getBoundingClientRect(); hideOverlay(); openPopup({ x: r.left + r.width / 2, y: r.bottom + 6, strike: d.strike, type: 'CE', action: 'S', price: d.ceLtp, refId: d.ceRefId, greeks: d.ceGreeks }); }}>S</button>
+      </div>
+      <div ref={peOverlayRef} className="oc-bs-overlay" style={{ display: 'none', position: 'fixed', left: 0, top: 0 }}
+        onMouseLeave={e => { const rel = e.relatedTarget as HTMLElement | null; if (typeof rel?.closest === 'function' && (rel.closest('.oc-row') || rel.closest('.oc-bs-overlay'))) return; hideOverlay(); }}>
+        <button className="oc-btn oc-btn-b" onMouseDown={e => { e.stopPropagation(); const d = overlayDataRef.current; if (!d) return; const r = (e.target as HTMLElement).getBoundingClientRect(); hideOverlay(); openPopup({ x: r.left + r.width / 2, y: r.bottom + 6, strike: d.strike, type: 'PE', action: 'B', price: d.peLtp, refId: d.peRefId, greeks: d.peGreeks }); }}>B</button>
+        <button className="oc-btn oc-btn-s" onMouseDown={e => { e.stopPropagation(); const d = overlayDataRef.current; if (!d) return; const r = (e.target as HTMLElement).getBoundingClientRect(); hideOverlay(); openPopup({ x: r.left + r.width / 2, y: r.bottom + 6, strike: d.strike, type: 'PE', action: 'S', price: d.peLtp, refId: d.peRefId, greeks: d.peGreeks }); }}>S</button>
       </div>
 
       {/* Qty popup */}
@@ -691,8 +759,21 @@ function OptionChainNubra({ symbol, expiries, sessionToken, exchange = 'NSE', on
                 <button onClick={() => setQty(q => q + 1)} style={{ width: 26, height: 26, background: 'transparent', border: 'none', color: '#9CA3AF', cursor: 'pointer', fontSize: 16, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>+</button>
               </div>
             </div>
+            {/* Historical inputs */}
+            {isHistoricalMode && (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 6, marginTop: 4 }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                  <span style={{ fontSize: 11, color: '#6B7280', fontWeight: 600, flex: 1 }}>Date</span>
+                  <input type="date" value={entryDate} onChange={e => setEntryDate(e.target.value)} style={{ width: 100, background: 'rgba(255,255,255,0.05)', border: '1px solid rgba(255,255,255,0.1)', borderRadius: 6, padding: '2px 6px', color: '#E2E8F0', fontSize: 12, outline: 'none' }} />
+                </div>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                  <span style={{ fontSize: 11, color: '#6B7280', fontWeight: 600, flex: 1 }}>Time</span>
+                  <input type="time" value={entryTime} onChange={e => setEntryTime(e.target.value)} style={{ width: 80, background: 'rgba(255,255,255,0.05)', border: '1px solid rgba(255,255,255,0.1)', borderRadius: 6, padding: '2px 6px', color: '#E2E8F0', fontSize: 12, outline: 'none' }} />
+                </div>
+              </div>
+            )}
             {/* Confirm */}
-            <button onClick={() => { onAddLeg?.({ symbol, expiry: selectedExpiry!, strike: popup.strike, type: popup.type, action: popup.action, price: popup.price, lots: qty, lotSize, refId: popup.refId, greeks: popup.greeks }); setPopup(null); }} style={{
+            <button onClick={() => { onAddLeg?.({ symbol, expiry: selectedExpiry!, strike: popup.strike, type: popup.type, action: popup.action, price: popup.price, lots: qty, lotSize, refId: popup.refId, greeks: popup.greeks, entryDate: isHistoricalMode ? entryDate : undefined, entryTime: isHistoricalMode ? entryTime : undefined }); setPopup(null); }} style={{
               padding: '6px 0', borderRadius: 7, background: accentBg, border: `1px solid ${accentBorder}`,
               color: accentColor, fontSize: 12, fontWeight: 700, cursor: 'pointer', letterSpacing: '0.04em',
             }}>Add to Basket</button>
@@ -927,7 +1008,7 @@ function OptionChainMCX({ symbol, instruments, onClose, onAddLeg, lotSize = 1, o
     mch.accessor(r => r.ce.ltp,   { id: 'mce_price', header: 'Call LTP', cell: i => {
       const row = i.row.original;
       return (
-        <div className="oc-ltp-cell">
+        <div className="oc-ltp-cell oc-ltp-cell-ce">
           <span className="oc-ltp-btn-wrap"><button className="oc-btn oc-btn-b" onClick={e => { e.stopPropagation(); const r = (e.target as HTMLElement).getBoundingClientRect(); setQty(1); setPopup({ x: r.left + r.width / 2, y: r.bottom + 6, strike: row.strike, type: 'CE', action: 'B', price: i.getValue(), instrumentKey: row.ceKey, greeks: { delta: row.ce.delta, theta: row.ce.theta, vega: row.ce.vega, gamma: row.ce.gamma, iv: row.ce.iv } }); }}>B</button></span>
           <span style={{ color: '#C0C0C0', fontWeight: 700 }}>{fmtPrice(i.getValue())}</span>
           <span className="oc-ltp-btn-wrap"><button className="oc-btn oc-btn-s" onClick={e => { e.stopPropagation(); const r = (e.target as HTMLElement).getBoundingClientRect(); setQty(1); setPopup({ x: r.left + r.width / 2, y: r.bottom + 6, strike: row.strike, type: 'CE', action: 'S', price: i.getValue(), instrumentKey: row.ceKey, greeks: { delta: row.ce.delta, theta: row.ce.theta, vega: row.ce.vega, gamma: row.ce.gamma, iv: row.ce.iv } }); }}>S</button></span>
@@ -935,12 +1016,12 @@ function OptionChainMCX({ symbol, instruments, onClose, onAddLeg, lotSize = 1, o
       );
     } }),
     mch.accessor(r => r.strike, { id: 'mstrike', header: 'Strike',
-      cell: i => { const row = i.row.original; return <span style={{ color: row.isAtm ? '#e0a800' : '#C0C0C0', fontWeight: row.isAtm ? 800 : 700 }}>{i.getValue() % 1 === 0 ? i.getValue().toFixed(0) : i.getValue().toFixed(2)}</span>; },
+      cell: i => { const row = i.row.original; return <span className="oc-strike-cell" style={{ color: row.isAtm ? '#e0a800' : '#C0C0C0', fontWeight: row.isAtm ? 800 : 700, display: 'block', width: '100%' }}>{i.getValue() % 1 === 0 ? i.getValue().toFixed(0) : i.getValue().toFixed(2)}</span>; },
     }),
     mch.accessor(r => r.pe.ltp,   { id: 'mpe_price', header: 'Put LTP',  cell: i => {
       const row = i.row.original;
       return (
-        <div className="oc-ltp-cell">
+        <div className="oc-ltp-cell oc-ltp-cell-pe">
           <span className="oc-ltp-btn-wrap"><button className="oc-btn oc-btn-b" onClick={e => { e.stopPropagation(); const r = (e.target as HTMLElement).getBoundingClientRect(); setQty(1); setPopup({ x: r.left + r.width / 2, y: r.bottom + 6, strike: row.strike, type: 'PE', action: 'B', price: i.getValue(), instrumentKey: row.peKey, greeks: { delta: row.pe.delta, theta: row.pe.theta, vega: row.pe.vega, gamma: row.pe.gamma, iv: row.pe.iv } }); }}>B</button></span>
           <span style={{ color: '#C0C0C0', fontWeight: 700 }}>{fmtPrice(i.getValue())}</span>
           <span className="oc-ltp-btn-wrap"><button className="oc-btn oc-btn-s" onClick={e => { e.stopPropagation(); const r = (e.target as HTMLElement).getBoundingClientRect(); setQty(1); setPopup({ x: r.left + r.width / 2, y: r.bottom + 6, strike: row.strike, type: 'PE', action: 'S', price: i.getValue(), instrumentKey: row.peKey, greeks: { delta: row.pe.delta, theta: row.pe.theta, vega: row.pe.vega, gamma: row.pe.gamma, iv: row.pe.iv } }); }}>S</button></span>
@@ -989,8 +1070,9 @@ function OptionChainMCX({ symbol, instruments, onClose, onAddLeg, lotSize = 1, o
         .oc-drag-handle { cursor: grab; opacity: 0.3; flex-shrink: 0; padding: 2px; }
         .oc-drag-handle:hover { opacity: 0.8; }
         .oc-ltp-cell { display: flex; align-items: center; justify-content: center; gap: 8px; }
-        .oc-ltp-btn-wrap { opacity: 0; pointer-events: none; transition: opacity 0.1s ease-in-out; }
-        .oc-tbody tr.oc-row:hover .oc-ltp-btn-wrap { opacity: 1; pointer-events: auto; }
+        .oc-ltp-btn-wrap { opacity: 0; pointer-events: none; transition: none; }
+        .oc-tbody tr.oc-row[data-hover-side="CE"]:hover .oc-ltp-cell-ce .oc-ltp-btn-wrap { opacity: 1; pointer-events: auto; }
+        .oc-tbody tr.oc-row[data-hover-side="PE"]:hover .oc-ltp-cell-pe .oc-ltp-btn-wrap { opacity: 1; pointer-events: auto; }
         .oc-btn { font-size: 11px; font-weight: 800; padding: 5px 10px; border-radius: 6px; border: none; cursor: pointer; letter-spacing: 0.08em; line-height: 1.5; transition: all 0.15s; }
         .oc-btn-b { background: rgba(38,166,154,0.15); color: #26a69a; border: 1px solid rgba(38,166,154,0.3); }
         .oc-btn-b:hover { background: rgba(38,166,154,0.25); border-color: rgba(38,166,154,0.5); }
@@ -1114,14 +1196,26 @@ function OptionChainMCX({ symbol, instruments, onClose, onAddLeg, lotSize = 1, o
                     )}
                     <tr className={`oc-row ${data.isAtm ? 'oc-row-atm' : ri % 2 === 0 ? 'oc-row-even' : 'oc-row-odd'}`}
                       ref={data.isAtm ? atmRowRef : undefined}
-                      style={{ borderBottom: '1px solid rgba(255,255,255,0.10)' }}>
+                      style={{ borderBottom: '1px solid rgba(255,255,255,0.10)' }}
+                      onMouseMove={e => {
+                        const tr = e.currentTarget;
+                        const rct = tr.getBoundingClientRect();
+                        const strikeCell = tr.querySelector('.oc-strike-cell');
+                        const strikeCenter = strikeCell ? (strikeCell.getBoundingClientRect().left + strikeCell.getBoundingClientRect().right) / 2 : rct.left + rct.width / 2;
+                        const side = e.clientX < strikeCenter ? 'CE' : 'PE';
+                        tr.setAttribute('data-hover-side', side);
+                      }}
+                      onMouseLeave={e => {
+                        e.currentTarget.removeAttribute('data-hover-side');
+                      }}
+                    >
                       {row.getVisibleCells().map(cell => {
                         const id = cell.column.id;
                         const isStrike = id === 'mstrike';
                         const isCe = MCX_CE_COLS.includes(id);
                         const cellBg = isCe && isCeItm ? 'rgba(0,168,132,0.18)' : !isCe && !isStrike && isPeItm ? 'rgba(210,130,0,0.28)' : undefined;
                         return (
-                          <td key={cell.id} style={{ width: MW[id], minWidth: MW[id], padding: '8px 10px', fontSize: 13, fontWeight: id === 'mstrike' ? 700 : 500, fontFamily: '-apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif', textAlign: isStrike ? 'center' : isCe ? 'right' : 'left', whiteSpace: 'nowrap', ...(cellBg ? { background: cellBg } : isStrike ? { background: '#333333' } : {}) }}>
+                          <td key={cell.id} className={isStrike ? 'oc-strike-cell' : ''} style={{ width: MW[id], minWidth: MW[id], padding: '8px 10px', fontSize: 13, fontWeight: id === 'mstrike' ? 700 : 500, fontFamily: '-apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif', textAlign: isStrike ? 'center' : isCe ? 'right' : 'left', whiteSpace: 'nowrap', ...(cellBg ? { background: cellBg } : isStrike ? { background: '#333333' } : {}) }}>
                             {flexRender(cell.column.columnDef.cell, cell.getContext())}
                           </td>
                         );

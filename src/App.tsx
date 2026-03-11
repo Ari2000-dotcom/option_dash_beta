@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { useInstruments, type Instrument } from './useInstruments';
-import { loadNubraInstruments } from './db';
+import { loadNubraInstruments, clearNubraInstruments, saveNubraInstruments } from './db';
 import type { NubraInstrument } from './useNubraInstruments';
 import OptionChain from './OptionChain';
 import BasketOrder, { type BasketLeg, DomSidePanel } from './BasketOrder';
@@ -791,13 +791,14 @@ function MtmGroupTable({ group, showGreeks, columns }: { group: { symbol: string
   );
 }
 
-function MtmLayout({ visible, workerRef, workerReady, workerModeRef, mtmResultsCbRef, instruments, onAddToBasket, execBasketRef }: {
+function MtmLayout({ visible, workerRef, workerReady, workerModeRef, mtmResultsCbRef, instruments, nubraInstruments, onAddToBasket, execBasketRef }: {
   visible: boolean;
   workerRef: React.RefObject<Worker | null>;
   workerReady: React.RefObject<boolean>;
   workerModeRef: React.RefObject<'header' | 'chart' | 'mtm'>;
   mtmResultsCbRef: React.RefObject<((results: Instrument[]) => void) | null>;
   instruments: Instrument[];
+  nubraInstruments: NubraInstrument[];
   onAddToBasket?: (leg: BasketLeg) => void;
   execBasketRef?: React.RefObject<((legs: BasketLeg[]) => void) | null>;
 }) {
@@ -811,6 +812,7 @@ function MtmLayout({ visible, workerRef, workerReady, workerModeRef, mtmResultsC
   const [showGreeks, setShowGreeks] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [layoutTheme, setLayoutTheme] = useState<'theme1' | 'theme2'>('theme1');
+  const [isHistoricalMode, setIsHistoricalMode] = useState(false);
 
   // Register "add basket legs to MTM" function into execBasketRef so App can call it on Execute
   useEffect(() => {
@@ -1163,45 +1165,11 @@ function MtmLayout({ visible, workerRef, workerReady, workerModeRef, mtmResultsC
   const [ocExchange, setOcExchange] = useState<string>('NSE');
   const [ocOpen, setOcOpen] = useState(false);
   const nubraSession = localStorage.getItem('nubra_session_token') ?? '';
+  const nubraExpiriesCache = useRef<Map<string, Set<string>>>(new Map());
 
-  // Nubra instruments from IndexedDB cache — for expiry list
-  const [nubraInstruments, setNubraInstruments] = useState<NubraInstrument[]>([]);
-  const [nubraIndexes, setNubraIndexes] = useState<Record<string, string>[]>([]);
-  useEffect(() => {
-    loadNubraInstruments().then(cached => {
-      if (!cached) return;
-      try {
-        const parsed = JSON.parse(cached.data);
-        setNubraInstruments(parsed.refdata ?? parsed);
-        setNubraIndexes(parsed.indexes ?? []);
-      } catch { /* ignore */ }
-    });
-  }, []);
+  const [nubraIndexes] = useState<Record<string, string>[]>([]);
 
-  // Compute sorted expiries from Nubra instruments
-  // NubraInstrument fields: asset, stock_name, nubra_name, derivative_type, option_type, expiry (YYYYMMDD int)
-  const ocExpiries = useMemo(() => {
-    if (!ocSymbol) return [];
-    const todayStr = new Date().toISOString().slice(0, 10).replace(/-/g, '');
-    const sym = ocSymbol.toUpperCase();
-    const expSet = new Set<string>();
-    for (const i of nubraInstruments) {
-      // Only options (CE/PE)
-      if ((i.option_type !== 'CE' && i.option_type !== 'PE') || !i.expiry) continue;
-      if (ocAssetType && i.asset_type !== ocAssetType) continue;
-      if (i.exchange !== ocExchange) continue;
-      // Match by asset name (primary) OR stock_name prefix OR nubra_name
-      const asset = (i.asset ?? '').toUpperCase();
-      const stockName = (i.stock_name ?? '').toUpperCase();
-      const nubraName = (i.nubra_name ?? '').toUpperCase();
-      const matches = asset === sym || nubraName === sym || stockName === sym;
-      if (matches) {
-        const expStr = String(i.expiry);
-        if (expStr >= todayStr) expSet.add(expStr);
-      }
-    }
-    return [...expSet].sort();
-  }, [ocSymbol, ocAssetType, ocExchange, nubraInstruments]);
+  const [ocExpiries, setOcExpiries] = useState<string[]>([]);
 
   // Lot size for the selected OC symbol
   const ocLotSize = useMemo(() => {
@@ -1214,11 +1182,16 @@ function MtmLayout({ visible, workerRef, workerReady, workerModeRef, mtmResultsC
     return match?.lot_size ?? 1;
   }, [ocSymbol, nubraInstruments]);
 
+  // Always-fresh refs so handleMtmSearch never has stale closure
+  const nubraInstrumentsRef = useRef<NubraInstrument[]>([]);
+  useEffect(() => { nubraInstrumentsRef.current = nubraInstruments; }, [nubraInstruments]);
+  const upstoxInstrumentsRef = useRef<Instrument[]>([]);
+  useEffect(() => { upstoxInstrumentsRef.current = instruments; }, [instruments]);
+
   // Search state
   const [mtmQuery, setMtmQuery] = useState('');
   const [mtmResults, setMtmResults] = useState<Instrument[]>([]);
-  const [mtmTab, setMtmTab] = useState<Tab>('ALL');
-  const [mtmCursor, setMtmCursor] = useState(0);
+const [mtmCursor, setMtmCursor] = useState(0);
   const [showMtmDropdown, setShowMtmDropdown] = useState(false);
   const mtmInputRef = useRef<HTMLInputElement>(null);
   const mtmDropdownRef = useRef<HTMLDivElement>(null);
@@ -1251,13 +1224,61 @@ function MtmLayout({ visible, workerRef, workerReady, workerModeRef, mtmResultsC
     setMtmCursor(0);
     if (mtmDebounce.current) clearTimeout(mtmDebounce.current);
     if (!v.trim()) { setMtmResults([]); setShowMtmDropdown(false); return; }
-    mtmDebounce.current = setTimeout(() => {
-      if (workerRef.current && workerReady.current) {
-        workerModeRef.current = 'mtm';
-        workerRef.current.postMessage({ type: 'SEARCH', query: v });
+    // Search locally from IndexedDB-cached nubraInstruments — exact prefix match per letter
+    const q = v.toUpperCase();
+    const todayStr = new Date().toISOString().slice(0, 10).replace(/-/g, '');
+    const list = nubraInstrumentsRef.current;
+    const expMap = new Map<string, Set<string>>();
+    const lotMap = new Map<string, number>();
+    for (const item of list) {
+      const asset = (item.asset ?? '').toUpperCase();
+      if (!asset.startsWith(q)) continue;
+      const key = `${item.asset}|${item.exchange}`;
+      if (!expMap.has(key)) { expMap.set(key, new Set()); lotMap.set(key, item.lot_size ?? 1); }
+      if (item.expiry) {
+        const expStr = String(item.expiry);
+        if (expStr >= todayStr) expMap.get(key)!.add(expStr);
       }
-    }, 150);
-  }, [workerRef, workerReady, workerModeRef]);
+    }
+    nubraExpiriesCache.current = expMap;
+    // Deduplicate by asset name — keep highest priority entry per unique asset
+    const atPriority: Record<string, number> = { INDEX: 0, INDEX_FO: 0, STOCK_FO: 1, STOCKS: 2, ETF: 3 };
+    const bestByAsset = new Map<string, typeof list[0]>();
+    for (const item of list) {
+      const assetUp = (item.asset ?? '').toUpperCase();
+      if (!assetUp.startsWith(q)) continue;
+      const existing = bestByAsset.get(assetUp);
+      if (!existing) { bestByAsset.set(assetUp, item); continue; }
+      const ep = atPriority[existing.asset_type] ?? 99;
+      const ip = atPriority[item.asset_type ?? ''] ?? 99;
+      if (ip < ep) bestByAsset.set(assetUp, item);
+    }
+    const nubraResults: Instrument[] = [...bestByAsset.values()].map(item => ({
+      instrument_key: `${item.exchange}:${item.asset}`,
+      trading_symbol: item.asset,
+      underlying_symbol: item.asset,
+      instrument_type: item.asset_type === 'INDEX_FO' || item.asset_type === 'INDEX' ? 'INDEX' : 'EQ',
+      exchange: item.exchange,
+      lot_size: item.lot_size ?? 1,
+      nubraAssetType: item.asset_type ?? '',
+    } as any));
+
+    // MCX instruments from Upstox cache — deduplicated by underlying_symbol
+    const mcxSeen = new Set<string>();
+    const mcxResults: Instrument[] = [];
+    for (const ins of upstoxInstrumentsRef.current) {
+      if (ins.exchange !== 'MCX') continue;
+      const sym = (ins.underlying_symbol || ins.trading_symbol || '').toUpperCase();
+      if (!sym.startsWith(q)) continue;
+      if (mcxSeen.has(sym)) continue;
+      mcxSeen.add(sym);
+      mcxResults.push({ ...ins, nubraAssetType: 'MCX' } as any);
+    }
+
+    setMtmResults([...nubraResults, ...mcxResults]);
+    setShowMtmDropdown(true);
+    setMtmCursor(0);
+  }, []);
 
   const onMouseDown = useCallback((e: React.MouseEvent) => {
     e.preventDefault();
@@ -1280,10 +1301,18 @@ function MtmLayout({ visible, workerRef, workerReady, workerModeRef, mtmResultsC
       style={{ display: visible ? 'flex' : 'none', padding: 12, gap: 12, background: 'var(--bg-base)' }}
     >
       {/* Left panel */}
-      <div style={{ width: `${leftPct}%`, background: '#171717', borderRadius: 10, border: '1px solid rgba(255,255,255,0.08)', display: 'flex', flexDirection: 'column', position: 'relative', overflow: 'hidden', minHeight: 0 }}>
+      <div style={{ 
+        width: `${leftPct}%`, 
+        background: isHistoricalMode ? 'rgba(255,152,0,0.06)' : '#171717', 
+        borderRadius: isHistoricalMode ? 16 : 10, 
+        border: isHistoricalMode ? '1.5px solid rgba(255,152,0,0.45)' : '1px solid rgba(255,255,255,0.08)',
+        boxShadow: isHistoricalMode ? '0 0 25px rgba(255,152,0,0.1) inset' : 'none',
+        display: 'flex', flexDirection: 'column', position: 'relative', overflow: 'hidden', minHeight: 0,
+        transition: 'all 0.3s ease-in-out'
+      }}>
         {/* Search bar + dropdown */}
         <div style={{ padding: '7px 10px', position: 'relative', display: 'flex', alignItems: 'center', gap: 8, flexShrink: 0 }}>
-          <div style={{ width: '55%', position: 'relative' }}>
+          <div style={{ width: '35%', position: 'relative' }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: 8, background: 'rgba(255,255,255,0.03)', border: '1px solid rgba(255,255,255,0.06)', borderRadius: 8, padding: '0 12px', height: 36, transition: 'all 0.2s', boxShadow: 'inset 0 2px 4px rgba(0,0,0,0.1)' }}>
               <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#565A6B" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="11" cy="11" r="8" /><path d="m21 21-4.35-4.35" /></svg>
               <input
@@ -1291,10 +1320,26 @@ function MtmLayout({ visible, workerRef, workerReady, workerModeRef, mtmResultsC
                 value={mtmQuery}
                 onChange={e => handleMtmSearch(e.target.value)}
                 onKeyDown={e => {
-                  const list = filterByTab(mtmResults.filter(i => i.instrument_type === 'EQ' || i.instrument_type === 'INDEX' || i.instrument_type === 'FUT'), mtmTab);
+                  const list = mtmResults;
                   if (e.key === 'ArrowDown') { e.preventDefault(); setMtmCursor(c => Math.min(c + 1, list.length - 1)); mtmListRef.current?.children[mtmCursor + 1]?.scrollIntoView({ block: 'nearest' }); }
                   else if (e.key === 'ArrowUp') { e.preventDefault(); setMtmCursor(c => Math.max(c - 1, 0)); mtmListRef.current?.children[mtmCursor - 1]?.scrollIntoView({ block: 'nearest' }); }
-                  else if (e.key === 'Enter' && list.length > 0) { const sel = list[mtmCursor]; setMtmQuery(sel.trading_symbol); setShowMtmDropdown(false); setOcSymbol(sel.underlying_symbol || sel.trading_symbol); setOcAssetType(sel.instrument_type === 'INDEX' ? 'INDEX_FO' : 'STOCK_FO'); setOcExchange(sel.exchange ?? 'NSE'); setOcOpen(true); }
+                  else if (e.key === 'Enter' && list.length > 0) {
+                    const sel = list[mtmCursor];
+                    const sym = sel.underlying_symbol || sel.trading_symbol;
+                    const exch = (sel.exchange ?? 'NSE').replace('_INDEX', '');
+                    const nubraAt = (sel as any).nubraAssetType as string ?? '';
+                    if (sel.exchange === 'MCX') {
+                      setMtmQuery(sym); setShowMtmDropdown(false);
+                      setOcSymbol(sym); setOcAssetType('STOCK_FO'); setOcExchange('MCX'); setOcOpen(true);
+                    } else {
+                      const cached = nubraExpiriesCache.current.get(`${sym}|${exch}`);
+                      if (cached) setOcExpiries([...cached].sort());
+                      setMtmQuery(sel.trading_symbol); setShowMtmDropdown(false);
+                      setOcSymbol(sym);
+                      setOcAssetType(nubraAt === 'INDEX_FO' || nubraAt === 'INDEX' ? 'INDEX_FO' : 'STOCK_FO');
+                      setOcExchange(exch); setOcOpen(true);
+                    }
+                  }
                   else if (e.key === 'Escape') { setShowMtmDropdown(false); }
                 }}
                 placeholder="Search instruments..."
@@ -1305,35 +1350,51 @@ function MtmLayout({ visible, workerRef, workerReady, workerModeRef, mtmResultsC
             {/* Dropdown */}
             {showMtmDropdown && (
               <div ref={mtmDropdownRef} style={{ position: 'absolute', top: '100%', left: 12, right: 12, zIndex: 999, background: '#1f1f1f', border: '1px solid rgba(255,255,255,0.09)', borderRadius: 10, boxShadow: '0 8px 32px rgba(0,0,0,0.5)', overflow: 'hidden', display: 'flex', flexDirection: 'column', maxHeight: 340 }}>
-                {/* Tab pills */}
-                <div style={{ display: 'flex', gap: 4, padding: '8px 12px', flexWrap: 'wrap', flexShrink: 0 }}>
-                  {(['ALL', 'Cash'] as Tab[]).map(t => (
-                    <button key={t} onClick={() => { setMtmTab(t); setMtmCursor(0); }} style={{ padding: '3px 10px', borderRadius: 20, fontSize: 11, fontWeight: 600, border: '1px solid', cursor: 'pointer', background: mtmTab === t ? 'rgba(79,142,247,0.15)' : 'transparent', borderColor: mtmTab === t ? 'rgba(79,142,247,0.4)' : 'rgba(255,255,255,0.08)', color: mtmTab === t ? '#4F8EF7' : '#565A6B' }}>{t}</button>
-                  ))}
-                </div>
-                <div style={{ height: 1, background: 'rgba(255,255,255,0.06)', flexShrink: 0 }} />
                 {/* Results list */}
                 <div ref={mtmListRef} style={{ overflowY: 'auto', flex: 1, scrollbarWidth: 'thin', scrollbarColor: '#2a2a2a transparent' }}>
-                  {filterByTab(mtmResults.filter(i => i.instrument_type === 'EQ' || i.instrument_type === 'INDEX' || i.instrument_type === 'FUT'), mtmTab).length === 0 ? (
+                  {mtmResults.length === 0 ? (
                     <div style={{ padding: '24px 16px', textAlign: 'center', fontSize: 12, color: '#3D4150' }}>No results for "{mtmQuery}"</div>
-                  ) : filterByTab(mtmResults.filter(i => i.instrument_type === 'EQ' || i.instrument_type === 'INDEX' || i.instrument_type === 'FUT'), mtmTab).map((ins, i) => (
-                    <div key={ins.instrument_key}
-                      onClick={() => { setMtmQuery(ins.trading_symbol); setShowMtmDropdown(false); setOcSymbol(ins.underlying_symbol || ins.trading_symbol); setOcAssetType(ins.instrument_type === 'INDEX' ? 'INDEX_FO' : 'STOCK_FO'); setOcExchange(ins.exchange ?? 'NSE'); setOcOpen(true); }}
-                      onMouseEnter={() => setMtmCursor(i)}
-                      style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '9px 14px', cursor: 'pointer', borderBottom: '1px solid rgba(255,255,255,0.03)', background: i === mtmCursor ? 'rgba(79,142,247,0.10)' : 'transparent', transition: 'background 0.08s' }}
-                    >
-                      <div style={{ width: 32, height: 32, flexShrink: 0, borderRadius: 7, background: 'rgba(255,255,255,0.06)', border: '1px solid rgba(255,255,255,0.08)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-                        {ins.exchange === 'NSE' ? <img src="https://s3-symbol-logo.tradingview.com/source/NSE.svg" alt="NSE" style={{ width: 20, height: 20, objectFit: 'contain', opacity: 0.85 }} />
-                          : ins.exchange === 'BSE' ? <img src="https://s3-symbol-logo.tradingview.com/source/BSE.svg" alt="BSE" style={{ width: 20, height: 20, objectFit: 'contain', opacity: 0.85 }} />
-                            : <span style={{ fontSize: 9, fontWeight: 700, color: '#9598A1' }}>{ins.exchange}</span>}
+                  ) : mtmResults.map((ins, i) => {
+                    const nubraAt = (ins as any).nubraAssetType as string ?? '';
+                    const isMcx = ins.exchange === 'MCX';
+                    const atColor: Record<string, string> = { INDEX_FO: '#818cf8', STOCK_FO: '#60a5fa', STOCKS: '#34d399', ETF: '#f59e0b', INDEX: '#818cf8', MCX: '#f97316' };
+                    const atBg: Record<string, string> = { INDEX_FO: 'rgba(129,140,248,0.12)', STOCK_FO: 'rgba(96,165,250,0.10)', STOCKS: 'rgba(52,211,153,0.10)', ETF: 'rgba(245,158,11,0.10)', INDEX: 'rgba(129,140,248,0.12)', MCX: 'rgba(249,115,22,0.12)' };
+                    return (
+                      <div key={ins.instrument_key}
+                        onClick={() => {
+                          const sym = ins.underlying_symbol || ins.trading_symbol;
+                          const exch = (ins.exchange ?? 'NSE').replace('_INDEX', '');
+                          if (isMcx) {
+                            // MCX: set symbol + exchange, no Nubra expiries needed
+                            setMtmQuery(sym); setShowMtmDropdown(false);
+                            setOcSymbol(sym); setOcAssetType('STOCK_FO'); setOcExchange('MCX'); setOcOpen(true);
+                          } else {
+                            const cached = nubraExpiriesCache.current.get(`${sym}|${exch}`);
+                            if (cached) setOcExpiries([...cached].sort());
+                            setMtmQuery(ins.trading_symbol); setShowMtmDropdown(false);
+                            setOcSymbol(sym);
+                            setOcAssetType(nubraAt === 'INDEX_FO' || nubraAt === 'INDEX' ? 'INDEX_FO' : 'STOCK_FO');
+                            setOcExchange(exch); setOcOpen(true);
+                          }
+                        }}
+                        onMouseEnter={() => setMtmCursor(i)}
+                        style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '9px 14px', cursor: 'pointer', borderBottom: '1px solid rgba(255,255,255,0.03)', background: i === mtmCursor ? 'rgba(79,142,247,0.10)' : 'transparent', transition: 'background 0.08s' }}
+                      >
+                        <div style={{ width: 32, height: 32, flexShrink: 0, borderRadius: 7, background: 'rgba(255,255,255,0.06)', border: '1px solid rgba(255,255,255,0.08)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                          {ins.exchange === 'NSE' ? <img src="https://s3-symbol-logo.tradingview.com/source/NSE.svg" alt="NSE" style={{ width: 20, height: 20, objectFit: 'contain', opacity: 0.85 }} />
+                            : ins.exchange === 'BSE' ? <img src="https://s3-symbol-logo.tradingview.com/source/BSE.svg" alt="BSE" style={{ width: 20, height: 20, objectFit: 'contain', opacity: 0.85 }} />
+                              : <span style={{ fontSize: 9, fontWeight: 700, color: '#9598A1' }}>{ins.exchange}</span>}
+                        </div>
+                        <div style={{ flex: 1, minWidth: 0 }}>
+                          <div style={{ fontSize: 13, fontWeight: 700, color: '#E0E3EB' }}><Highlight text={ins.trading_symbol} query={mtmQuery} /></div>
+                          <div style={{ fontSize: 11, color: '#565A6B', marginTop: 1 }}>{ins.exchange}</div>
+                        </div>
+                        {nubraAt && (
+                          <span style={{ fontSize: 10, padding: '2px 7px', borderRadius: 4, background: atBg[nubraAt] ?? 'rgba(255,255,255,0.05)', color: atColor[nubraAt] ?? '#565A6B', fontWeight: 700, textTransform: 'uppercase', flexShrink: 0, letterSpacing: '0.03em' }}>{nubraAt}</span>
+                        )}
                       </div>
-                      <div style={{ flex: 1, minWidth: 0 }}>
-                        <div style={{ fontSize: 13, fontWeight: 700, color: '#E0E3EB' }}><Highlight text={ins.trading_symbol} query={mtmQuery} /></div>
-                        <div style={{ fontSize: 11, color: '#565A6B', marginTop: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}><Highlight text={ins.name} query={mtmQuery} /></div>
-                      </div>
-                      <span style={{ fontSize: 10, padding: '2px 7px', borderRadius: 4, background: 'rgba(255,255,255,0.05)', color: '#565A6B', fontWeight: 600, textTransform: 'uppercase', flexShrink: 0 }}>{ins.instrument_type}</span>
-                    </div>
-                  ))}
+                    );
+                  })}
                 </div>
                 <div style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '6px 14px', borderTop: '1px solid rgba(255,255,255,0.06)', background: 'rgba(0,0,0,0.2)', flexShrink: 0 }}>
                   <span style={{ fontSize: 11, color: '#4A4E5C' }}><kbd style={{ fontFamily: '-apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif' }}>↵</kbd> select</span>
@@ -1342,6 +1403,14 @@ function MtmLayout({ visible, workerRef, workerReady, workerModeRef, mtmResultsC
               </div>
             )}
           </div>
+          
+          <label className="inline-flex items-center cursor-pointer ml-3">
+            <span className={`select-none text-[13px] font-semibold tracking-wide mr-2 transition-colors duration-200 ${!isHistoricalMode ? 'text-[#34d399]' : 'text-[#6B7280]'}`} style={{ fontFamily: '-apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif' }}>Live</span>
+            <input type="checkbox" className="sr-only peer" checked={isHistoricalMode} onChange={e => setIsHistoricalMode(e.target.checked)} />
+            <div className={`relative w-10 h-[22px] rounded-full peer peer-focus:outline-none peer-checked:after:translate-x-full after:content-[''] after:absolute after:top-[3px] after:left-[3px] after:bg-white after:rounded-full after:h-4 after:w-4 after:transition-all ${isHistoricalMode ? 'bg-[#FF9800]' : 'bg-[#333333]'} shadow-inner border border-[rgba(255,255,255,0.05)]`}></div>
+            <span className={`select-none text-[13px] font-semibold tracking-wide ml-2 transition-colors duration-200 ${isHistoricalMode ? 'text-[#FF9800]' : 'text-[#6B7280]'}`} style={{ fontFamily: '-apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif' }}>History</span>
+          </label>
+
           <div style={{ flex: 1 }} />
           {/* Layout theme switcher — far right */}
           <div style={{ display: 'flex', alignItems: 'center', gap: 4, flexShrink: 0 }}>
@@ -1550,9 +1619,9 @@ function MtmLayout({ visible, workerRef, workerReady, workerModeRef, mtmResultsC
       {ocOpen && ocSymbol && (
         <div style={{
           position: 'absolute',
-          left: `calc(${leftPct}% + 8px - 800px)`,
+          left: `calc(${leftPct}% + 8px - 1000px)`,
           top: 8, bottom: 8,
-          width: 800, zIndex: 55,
+          width: 1000, zIndex: 55,
           background: '#171717',
           border: '1px solid rgba(255,255,255,0.12)',
           borderRadius: 10,
@@ -1582,6 +1651,64 @@ function MtmLayout({ visible, workerRef, workerReady, workerModeRef, mtmResultsC
 // ── App ───────────────────────────────────────────────────────────────────────
 export default function App() {
   const { instruments, status } = useInstruments();
+
+  // Nubra instruments loaded from IndexedDB — shared across MTM + StrategyChart
+  // Auto-refreshes daily: if cached date != today (IST), clears and re-fetches silently
+  const [nubraInstruments, setNubraInstruments] = useState<NubraInstrument[]>([]);
+  useEffect(() => {
+    const todayIST = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
+    const cacheKey = `prod:${todayIST}`;
+
+    function applyParsed(parsed: any) {
+      const refdata: NubraInstrument[] = parsed.refdata ?? parsed;
+      const indexRows: NubraInstrument[] = (parsed.indexes ?? []).map((idx: Record<string, string>) => ({
+        ref_id: idx.ref_id ?? idx.token ?? '',
+        stock_name: idx.symbol ?? idx.name ?? '',
+        nubra_name: idx.nubra_name ?? '',
+        strike_price: null,
+        option_type: 'N/A',
+        token: idx.token ?? '',
+        lot_size: 1,
+        tick_size: 0.05,
+        asset: idx.symbol ?? idx.name ?? '',
+        expiry: null,
+        exchange: idx.exchange ?? 'NSE',
+        derivative_type: 'INDEX',
+        isin: '',
+        asset_type: 'INDEX',
+      }));
+      setNubraInstruments([...refdata, ...indexRows]);
+    }
+
+    async function fetchAndStore() {
+      const sessionToken = localStorage.getItem('nubra_session_token');
+      if (!sessionToken) return;
+      const authToken = localStorage.getItem('nubra_auth_token') ?? '';
+      const deviceId = localStorage.getItem('nubra_device_id') ?? '';
+      const params = new URLSearchParams({ session_token: sessionToken });
+      if (authToken) params.set('auth_token', authToken);
+      if (deviceId) params.set('device_id', deviceId);
+      try {
+        const res = await fetch(`/api/nubra-instruments?${params}`);
+        if (!res.ok) return;
+        const json = await res.json();
+        if ((json.refdata ?? []).length === 0) return;
+        await saveNubraInstruments(JSON.stringify(json), cacheKey);
+        applyParsed(json);
+      } catch { /* silent */ }
+    }
+
+    loadNubraInstruments().then(cached => {
+      if (cached && cached.date === cacheKey) {
+        // Cache is fresh for today — use it
+        try { applyParsed(JSON.parse(cached.data)); } catch { /* ignore */ }
+      } else {
+        // Stale or missing — clear and re-fetch silently
+        clearNubraInstruments().catch(() => {});
+        fetchAndStore();
+      }
+    });
+  }, []);
   const [page, setPage] = useState<Page>('chart');
   // Tracks which pages have been visited — lazy-mount keep-alive pattern.
   // Once a page is visited it is never unmounted (state + WS survive tab switches).
@@ -2155,7 +2282,7 @@ export default function App() {
 
           {/* MTM Analyzer */}
           {(page === 'mtm' || visited.has('mtm')) && (
-            <MtmLayout visible={page === 'mtm'} workerRef={workerRef} workerReady={workerReady} workerModeRef={workerModeRef} mtmResultsCbRef={mtmSearchResultsCallbackRef} instruments={instruments} onAddToBasket={handleAddToBasket} execBasketRef={execBasketRef} />
+            <MtmLayout visible={page === 'mtm'} workerRef={workerRef} workerReady={workerReady} workerModeRef={workerModeRef} mtmResultsCbRef={mtmSearchResultsCallbackRef} instruments={instruments} nubraInstruments={nubraInstruments} onAddToBasket={handleAddToBasket} execBasketRef={execBasketRef} />
           )}
 
         </main>

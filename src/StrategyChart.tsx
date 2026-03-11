@@ -271,7 +271,7 @@ export default function StrategyChart({ legs, ocSymbol, ocExchange, nubraInstrum
   showIvRef.current    = showIv;
 
   const uniqueLegs = legs.filter((leg, i, arr) =>
-    arr.findIndex(l => l.strike === leg.strike && l.type === leg.type) === i
+    arr.findIndex(l => l.strike === leg.strike && l.type === leg.type && l.expiry === leg.expiry) === i
   );
   // Keep legsRef always fresh so callbacks with [] deps can read latest legs
   legsRef.current = legs;
@@ -446,7 +446,7 @@ export default function StrategyChart({ legs, ocSymbol, ocExchange, nubraInstrum
     const chart = chartRef.current;
     if (!chart) return;
     const ss = seriesRef.current;
-    const newLegKeys = new Set(uniqueLegs.map(l => `${l.strike}${l.type}`));
+    const newLegKeys = new Set(uniqueLegs.map(l => `${l.strike}${l.type}:${l.expiry}`));
 
     for (const [key, s] of ss.options) {
       if (!newLegKeys.has(key)) { try { chart.removeSeries(s); } catch { /**/ } ss.options.delete(key); }
@@ -469,15 +469,28 @@ export default function StrategyChart({ legs, ocSymbol, ocExchange, nubraInstrum
       chart.priceScale('left').applyOptions({ scaleMargins: { top: 0.04, bottom: 0.52 } });
     }
 
+    // Short expiry label e.g. "17Mar" from "17 Mar 26" or "2026-03-17"
+    const shortExpiry = (expiry: string): string => {
+      const months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+      // Try "DD Mon YY" format e.g. "17 Mar 26"
+      const m1 = expiry.match(/^(\d{1,2})\s+([A-Za-z]{3})/);
+      if (m1) return `${m1[1]}${m1[2].charAt(0).toUpperCase() + m1[2].slice(1,3).toLowerCase()}`;
+      // Try "YYYY-MM-DD" format
+      const m2 = expiry.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+      if (m2) return `${parseInt(m2[3])}${months[parseInt(m2[2]) - 1]}`;
+      return expiry;
+    };
+
     let ceCount = 0, peCount = 0;
     for (const leg of uniqueLegs) {
-      const key = `${leg.strike}${leg.type}`;
+      const key = `${leg.strike}${leg.type}:${leg.expiry}`;
       const colorIdx = leg.type === 'CE' ? ceCount++ : peCount++;
       const color = optionColor(leg.type, colorIdx);
+      const label = `${leg.strike}${leg.type} ${shortExpiry(leg.expiry)}`;
 
       if (!ss.options.has(key)) {
         ss.options.set(key, chart.addSeries(LineSeries, {
-          color, lineWidth: 2 as 2, title: `${leg.strike}${leg.type}`,
+          color, lineWidth: 2 as 2, title: label,
           priceFormat: { type: 'price', precision: 2, minMove: 0.05 },
           priceScaleId: 'right',
         }, 0));
@@ -486,7 +499,7 @@ export default function StrategyChart({ legs, ocSymbol, ocExchange, nubraInstrum
       if (!ss.deltas.has(key)) {
         ss.deltas.set(key, chart.addSeries(LineSeries, {
           color: leg.type === 'CE' ? DELTA_COLORS[colorIdx % DELTA_COLORS.length] : PE_COLORS[colorIdx % PE_COLORS.length],
-          lineWidth: 2 as 2, title: `Δ ${leg.strike}${leg.type}`,
+          lineWidth: 2 as 2, title: `Δ ${label}`,
           priceFormat: { type: 'price', precision: 4, minMove: 0.0001 },
         }, 1));
         try { chart.panes()[1]?.setHeight(110); } catch { /**/ }
@@ -494,7 +507,7 @@ export default function StrategyChart({ legs, ocSymbol, ocExchange, nubraInstrum
       if (!ss.ivs.has(key)) {
         ss.ivs.set(key, chart.addSeries(LineSeries, {
           color: IV_COLORS[colorIdx % IV_COLORS.length],
-          lineWidth: 2 as 2, title: `IV ${leg.strike}${leg.type}`,
+          lineWidth: 2 as 2, title: `IV ${label}`,
           priceFormat: { type: 'percent', precision: 2, minMove: 0.01 },
         }, 2));
         try { chart.panes()[2]?.setHeight(90); } catch { /**/ }
@@ -537,7 +550,7 @@ export default function StrategyChart({ legs, ocSymbol, ocExchange, nubraInstrum
     }
     items.push({ label: 'MTM', color: '#26a69a' });
     setLegendItems(items);
-  }, [ocSymbol, uniqueLegs.map(l => `${l.strike}${l.type}`).join(',')]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [ocSymbol, uniqueLegs.map(l => `${l.strike}${l.type}:${l.expiry}`).join(',')]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // ── Push accum into chart series ──────────────────────────────────────────────
   const flushAccum = useCallback((prepend = false) => {
@@ -665,7 +678,7 @@ export default function StrategyChart({ legs, ocSymbol, ocExchange, nubraInstrum
       let entryUnix = 0;
       if (date === today) {
         for (const { key } of legInfos) {
-          const leg = uniqueLegs.find(l => `${l.strike}${l.type}` === key);
+          const leg = uniqueLegs.find(l => `${l.strike}${l.type}:${l.expiry}` === key);
           if (!leg?.entryTime) continue;
           const [hh, mm] = leg.entryTime.split(':').map(Number);
           const [yr, mo, dy] = date.split('-').map(Number);
@@ -697,7 +710,7 @@ export default function StrategyChart({ legs, ocSymbol, ocExchange, nubraInstrum
       acc.mtm = timestamps.map(t => {
         let total = 0;
         for (const { key } of legInfos) {
-          const leg = uniqueLegs.find(l => `${l.strike}${l.type}` === key);
+          const leg = uniqueLegs.find(l => `${l.strike}${l.type}:${l.expiry}` === key);
           if (!leg) continue;
           const currLtp = optMaps.get(key)?.get(t) ?? 0;
           total += (leg.action === 'B' ? currLtp - leg.price : leg.price - currLtp) * leg.lots * (leg.lotSize || 1);
@@ -731,8 +744,8 @@ export default function StrategyChart({ legs, ocSymbol, ocExchange, nubraInstrum
 
     for (const leg of uniqueLegs) {
       const info = resolveOption(leg);
-      if (!info) { errors.push(`no symbol for ${leg.strike}${leg.type}`); continue; }
-      legInfos.push({ key: `${leg.strike}${leg.type}`, ...info });
+      if (!info) { errors.push(`no symbol for ${leg.strike}${leg.type} ${leg.expiry}`); continue; }
+      legInfos.push({ key: `${leg.strike}${leg.type}:${leg.expiry}`, ...info });
     }
 
     try {
@@ -770,7 +783,7 @@ export default function StrategyChart({ legs, ocSymbol, ocExchange, nubraInstrum
     const legInfos: { key: string; symbol: string; exchange: string }[] = [];
     for (const leg of uniqueLegs) {
       const info = resolveOption(leg);
-      if (info) legInfos.push({ key: `${leg.strike}${leg.type}`, ...info });
+      if (info) legInfos.push({ key: `${leg.strike}${leg.type}:${leg.expiry}`, ...info });
     }
 
     // Snapshot visible range BEFORE async work so we can restore it after setData
@@ -894,12 +907,14 @@ export default function StrategyChart({ legs, ocSymbol, ocExchange, nubraInstrum
         }
 
         // ── Build maps: key → { ltp, delta, iv } from WS tick ──
+        // Key includes expiry so same strike from different expiries don't overwrite each other
         type TickFields = { ltp: number; delta: number; iv: number };
         const tickMap = new Map<string, TickFields>();
+        const expiry = d.expiry ?? '';
         for (const opt of (d.ce ?? []) as Record<string, number>[]) {
           const strike = opt.strike_price ?? 0;
           if (!strike) continue;
-          tickMap.set(`${strike}CE`, {
+          tickMap.set(`${strike}CE:${expiry}`, {
             ltp:   opt.last_traded_price ?? 0,
             delta: opt.delta ?? 0,
             iv:    (opt.iv ?? 0) * 100,   // same scale as historical (×100 = percent)
@@ -908,65 +923,69 @@ export default function StrategyChart({ legs, ocSymbol, ocExchange, nubraInstrum
         for (const opt of (d.pe ?? []) as Record<string, number>[]) {
           const strike = opt.strike_price ?? 0;
           if (!strike) continue;
-          tickMap.set(`${strike}PE`, {
+          tickMap.set(`${strike}PE:${expiry}`, {
             ltp:   opt.last_traded_price ?? 0,
             delta: opt.delta ?? 0,
             iv:    (opt.iv ?? 0) * 100,
           });
         }
 
-        // ── Update option price, delta, IV series ──
-        let mtmTotal = 0;
-        let allLegsHaveData = true;
-
+        // ── Update option price, delta, IV series from this tick ──
+        const t = nowUnix as unknown as Time;
         for (const leg of uniqueLegs) {
-          const key = `${leg.strike}${leg.type}`;
+          const key = `${leg.strike}${leg.type}:${leg.expiry}`;
           const tick = tickMap.get(key);
-          if (!tick || tick.ltp === 0) { allLegsHaveData = false; continue; }
-
-          const t = nowUnix as unknown as Time;
+          if (!tick || tick.ltp === 0) continue;
 
           // Option price
           const optPts = acc.options.get(key) ?? [];
           upsert(optPts, ss.options.get(key) ?? null, { time: t, value: tick.ltp });
           acc.options.set(key, optPts);
 
-          // Delta — only update if toggle is on (use ref to avoid stale closure)
+          // Delta — only update if toggle is on
           if (showDeltaRef.current) {
             const dPts = acc.deltas.get(key) ?? [];
             upsert(dPts, ss.deltas.get(key) ?? null, { time: t, value: tick.delta });
             acc.deltas.set(key, dPts);
           }
 
-          // IV — only update if toggle is on (use ref to avoid stale closure)
+          // IV — only update if toggle is on
           if (showIvRef.current) {
             const ivPts = acc.ivs.get(key) ?? [];
             upsert(ivPts, ss.ivs.get(key) ?? null, { time: t, value: tick.iv });
             acc.ivs.set(key, ivPts);
           }
-
-          // MTM accumulate
-          mtmTotal += (leg.action === 'B' ? tick.ltp - leg.price : leg.price - tick.ltp) * leg.lots * (leg.lotSize || 1);
         }
 
-        // ── MTM — only from entry time ──
-        if (allLegsHaveData && ss.mtm) {
+        // ── MTM: recompute from latest known LTP for each leg (cross-expiry safe) ──
+        // Each WS message covers one expiry — use acc.options for the latest price of all legs
+        if (ss.mtm) {
           let entryUnix = 0;
           for (const leg of uniqueLegs) {
             if (!leg.entryTime) continue;
             const [hh, mm] = leg.entryTime.split(':').map(Number);
             const now2 = new Date();
             const midUtc = Date.UTC(now2.getUTCFullYear(), now2.getUTCMonth(), now2.getUTCDate()) / 1000;
-            // Floor to minute — matches 1-min candle boundaries
             const legUnix = midUtc + hh * 3600 + mm * 60 - 5.5 * 3600;
             if (legUnix > entryUnix) entryUnix = legUnix;
           }
           if (entryUnix === 0 || nowUnix >= entryUnix) {
-            const mtmPt: BaselineData = { time: nowUnix as unknown as Time, value: mtmTotal };
-            const last = acc.mtm[acc.mtm.length - 1];
-            if (last && (last.time as number) === nowUnix) acc.mtm[acc.mtm.length - 1] = mtmPt;
-            else acc.mtm.push(mtmPt);
-            ss.mtm.update(mtmPt);
+            let mtmTotal = 0;
+            let hasAll = true;
+            for (const leg of uniqueLegs) {
+              const key = `${leg.strike}${leg.type}:${leg.expiry}`;
+              const pts = acc.options.get(key);
+              const latestLtp = pts && pts.length > 0 ? pts[pts.length - 1].value : 0;
+              if (!latestLtp) { hasAll = false; continue; }
+              mtmTotal += (leg.action === 'B' ? latestLtp - leg.price : leg.price - latestLtp) * leg.lots * (leg.lotSize || 1);
+            }
+            if (hasAll) {
+              const mtmPt: BaselineData = { time: nowUnix as unknown as Time, value: mtmTotal };
+              const last = acc.mtm[acc.mtm.length - 1];
+              if (last && (last.time as number) === nowUnix) acc.mtm[acc.mtm.length - 1] = mtmPt;
+              else acc.mtm.push(mtmPt);
+              ss.mtm.update(mtmPt);
+            }
           }
         }
 
@@ -1006,7 +1025,7 @@ export default function StrategyChart({ legs, ocSymbol, ocExchange, nubraInstrum
     const acc = accumRef.current;
     const today = lastTradingDay();
     const legs = legsRef.current.filter((leg, i, arr) =>
-      arr.findIndex(l => l.strike === leg.strike && l.type === leg.type) === i
+      arr.findIndex(l => l.strike === leg.strike && l.type === leg.type && l.expiry === leg.expiry) === i
     );
     for (const date of loadedDatesRef.current) {
       if (greeksLoadedRef.current.has(date)) continue;
@@ -1015,7 +1034,7 @@ export default function StrategyChart({ legs, ocSymbol, ocExchange, nubraInstrum
         const info = (() => {
           if (leg.refId) {
             const ins = nubraInstruments.find(i => String(i.ref_id) === String(leg.refId));
-            if (ins) return { key: `${leg.strike}${leg.type}`, symbol: ins.stock_name || ins.nubra_name, exchange: ins.exchange || 'NSE' };
+            if (ins) return { key: `${leg.strike}${leg.type}:${leg.expiry}`, symbol: ins.stock_name || ins.nubra_name, exchange: ins.exchange || 'NSE' };
           }
           const strikePaise = Math.round(leg.strike * 100);
           const sym = ocSymbol.toUpperCase();
@@ -1025,7 +1044,7 @@ export default function StrategyChart({ legs, ocSymbol, ocExchange, nubraInstrum
             Math.abs((i.strike_price ?? 0) - strikePaise) < 2 &&
             ((i.asset ?? '').toUpperCase() === sym || (i.nubra_name ?? '').toUpperCase() === sym || (i.stock_name ?? '').toUpperCase().startsWith(sym))
           );
-          if (ins) return { key: `${leg.strike}${leg.type}`, symbol: ins.stock_name || ins.nubra_name, exchange: ins.exchange || 'NSE' };
+          if (ins) return { key: `${leg.strike}${leg.type}:${leg.expiry}`, symbol: ins.stock_name || ins.nubra_name, exchange: ins.exchange || 'NSE' };
           return null;
         })();
         if (!info) continue;
@@ -1055,7 +1074,7 @@ export default function StrategyChart({ legs, ocSymbol, ocExchange, nubraInstrum
     const acc = accumRef.current;
     const today = lastTradingDay();
     const legs = legsRef.current.filter((leg, i, arr) =>
-      arr.findIndex(l => l.strike === leg.strike && l.type === leg.type) === i
+      arr.findIndex(l => l.strike === leg.strike && l.type === leg.type && l.expiry === leg.expiry) === i
     );
     for (const date of loadedDatesRef.current) {
       if (greeksLoadedRef.current.has(date)) continue;
@@ -1064,7 +1083,7 @@ export default function StrategyChart({ legs, ocSymbol, ocExchange, nubraInstrum
         const info = (() => {
           if (leg.refId) {
             const ins = nubraInstruments.find(i => String(i.ref_id) === String(leg.refId));
-            if (ins) return { key: `${leg.strike}${leg.type}`, symbol: ins.stock_name || ins.nubra_name, exchange: ins.exchange || 'NSE' };
+            if (ins) return { key: `${leg.strike}${leg.type}:${leg.expiry}`, symbol: ins.stock_name || ins.nubra_name, exchange: ins.exchange || 'NSE' };
           }
           const strikePaise = Math.round(leg.strike * 100);
           const sym = ocSymbol.toUpperCase();
@@ -1074,7 +1093,7 @@ export default function StrategyChart({ legs, ocSymbol, ocExchange, nubraInstrum
             Math.abs((i.strike_price ?? 0) - strikePaise) < 2 &&
             ((i.asset ?? '').toUpperCase() === sym || (i.nubra_name ?? '').toUpperCase() === sym || (i.stock_name ?? '').toUpperCase().startsWith(sym))
           );
-          if (ins) return { key: `${leg.strike}${leg.type}`, symbol: ins.stock_name || ins.nubra_name, exchange: ins.exchange || 'NSE' };
+          if (ins) return { key: `${leg.strike}${leg.type}:${leg.expiry}`, symbol: ins.stock_name || ins.nubra_name, exchange: ins.exchange || 'NSE' };
           return null;
         })();
         if (!info) continue;
@@ -1117,7 +1136,7 @@ export default function StrategyChart({ legs, ocSymbol, ocExchange, nubraInstrum
             <span style={{ fontSize: 11, fontWeight: 700, color: '#D1D4DC', letterSpacing: '0.06em' }}>STRATEGY CHART</span>
             <span style={{ fontSize: 10, color: '#3D4150' }}>·</span>
             <span style={{ fontSize: 11, color: UNDERLYING_COLOR, fontWeight: 600 }}>{ocSymbol}</span>
-            <span style={{ fontSize: 10, color: '#565A6B' }}>{uniqueLegs.length} strike{uniqueLegs.length !== 1 ? 's' : ''}</span>
+            <span style={{ fontSize: 10, color: '#565A6B' }}>{uniqueLegs.length} leg{uniqueLegs.length !== 1 ? 's' : ''}</span>
             {fromDate && toDate && (
               <span style={{ fontSize: 10, color: '#565A6B', fontFamily: 'monospace' }}>
                 {fromDate === toDate ? formatDate(fromDate) : `${formatDate(fromDate)} – ${formatDate(toDate)}`}

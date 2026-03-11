@@ -59,6 +59,10 @@ export default defineConfig({
         target: 'http://localhost:3001',
         changeOrigin: false,
       },
+      '/api/nubra-search': {
+        target: 'http://localhost:3001',
+        changeOrigin: false,
+      },
       '/api/nubra-optionchain': {
         target: 'http://localhost:3001',
         changeOrigin: false,

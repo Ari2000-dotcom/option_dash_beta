@@ -619,6 +619,64 @@ app.get('/api/nubra-instruments', async (req, reply) => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
+// GET /api/nubra-expiries?session_token=&symbol=NIFTY&exchange=NSE
+// Fetches today's refdata and returns unique expiries for the given symbol
+// ─────────────────────────────────────────────────────────────────────────────
+app.get('/api/nubra-expiries', async (req, reply) => {
+  const { session_token, symbol, exchange = 'NSE' } = req.query as Record<string, string>;
+  if (!session_token || !symbol) return reply.status(400).send({ error: 'session_token and symbol required' });
+  const deviceId = getDeviceId();
+  const today = new Date().toISOString().slice(0, 10);
+  const url = `${NUBRA_API}/refdata/refdata/${today}?exchange=${exchange}`;
+  try {
+    const res = await fetch(url, {
+      headers: { 'Authorization': `Bearer ${session_token}`, 'x-device-id': deviceId, 'Accept': 'application/json' },
+      dispatcher: nubraAuthAgent,
+    } as any);
+    if (!res.ok) return reply.status(res.status).send({ error: await res.text() });
+    const json = await res.json() as any;
+    const sym = symbol.toUpperCase();
+    const expSet = new Set<number>();
+    for (const item of (json.refdata ?? [])) {
+      if ((item.asset ?? '').toUpperCase() === sym && (item.option_type === 'CE' || item.option_type === 'PE')) {
+        expSet.add(item.expiry);
+      }
+    }
+    reply.send({ expiries: [...expSet].sort() });
+  } catch (err) {
+    reply.status(500).send({ error: String(err) });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /api/nubra-search?session_token=&query=NIF&assetTypes=&exactMatch=false
+// Proxies Nubra advancedsearch for instrument search
+// ─────────────────────────────────────────────────────────────────────────────
+app.get('/api/nubra-search', async (req, reply) => {
+  const { session_token, query, assetTypes = '', exactMatch = 'false' } = req.query as Record<string, string>;
+  if (!session_token || !query) {
+    return reply.status(400).send({ error: 'session_token and query are required' });
+  }
+  const deviceId = getDeviceId();
+  const url = `${NUBRA_API}/refdata/advancedsearch?query=${encodeURIComponent(query)}&assetTypes=${assetTypes}&exactMatch=${exactMatch}`;
+  try {
+    const res = await fetch(url, {
+      headers: {
+        'Authorization': `Bearer ${session_token}`,
+        'x-device-id': deviceId,
+        'Accept': 'application/json',
+      },
+      dispatcher: nubraAuthAgent,
+    } as any);
+    const body = await res.text();
+    if (!res.ok) return reply.status(res.status).send({ error: body });
+    reply.header('Content-Type', 'application/json').send(body);
+  } catch (err) {
+    reply.status(500).send({ error: String(err) });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
 // GET /api/nubra-optionchain?session_token=&instrument=NIFTY&exchange=NSE&expiry=20260327
 // Proxies Nubra REST option chain for after-hours use
 // ─────────────────────────────────────────────────────────────────────────────
@@ -936,6 +994,78 @@ app.post('/api/upstox-login', async (req, reply) => {
   } catch (e: any) {
     browser?.close?.();
     console.error('[upstox-login error]', e);
+    return reply.status(500).send({ error: e.message });
+  }
+});
+
+// GET /api/upstox-login-debug — runs Playwright in VISIBLE mode so you can watch the login flow
+app.get('/api/upstox-login-debug', async (_req, reply) => {
+  const API_KEY      = process.env.UPSTOX_API_KEY      ?? '';
+  const API_SECRET   = process.env.UPSTOX_API_SECRET    ?? '';
+  const REDIRECT_URI = process.env.UPSTOX_REDIRECT_URI  ?? 'http://127.0.0.1:3001/upstox/callback';
+  const PHONE        = process.env.UPSTOX_PHONE         ?? '';
+  const PIN          = process.env.UPSTOX_PIN           ?? '';
+  const TOTP_SECRET  = process.env.UPSTOX_TOTP_SECRET   ?? '';
+
+  if (!API_KEY || !PHONE || !PIN || !TOTP_SECRET) {
+    return reply.status(400).send({ error: 'Missing UPSTOX_* env vars' });
+  }
+
+  let chromium: any;
+  try { ({ chromium } = await import('playwright')); }
+  catch { return reply.status(500).send({ error: 'playwright not installed' }); }
+
+  const authUrl =
+    `https://api.upstox.com/v2/login/authorization/dialog` +
+    `?response_type=code&client_id=${encodeURIComponent(API_KEY)}` +
+    `&redirect_uri=${encodeURIComponent(REDIRECT_URI)}`;
+
+  let browser: any;
+  try {
+    // headless: false — opens a visible Chrome window so you can watch
+    browser = await chromium.launch({ headless: false, slowMo: 500 });
+    const page = await browser.newPage();
+    await page.goto(authUrl, { waitUntil: 'load' });
+
+    await page.waitForSelector('#mobileNum', { timeout: 20000 });
+    await page.fill('#mobileNum', PHONE);
+    await page.click('#getOtp');
+    console.log('[debug-login] phone submitted');
+
+    await page.waitForSelector('#otpNum', { timeout: 20000 });
+    console.log('[debug-login] TOTP screen visible — waiting 15s for phone notification…');
+    await new Promise(r => setTimeout(r, 15000));
+    const otp = generateTotp(TOTP_SECRET);
+    console.log('[debug-login] TOTP:', otp);
+    await page.fill('#otpNum', otp);
+    await page.click('#continueBtn');
+
+    await page.waitForSelector('#pinCode', { timeout: 20000 });
+    await page.fill('#pinCode', PIN);
+    await page.click('#pinContinueBtn');
+
+    const authCode = await new Promise<string>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('Redirect timeout (30s)')), 30000);
+      page.route('**', (route: any) => {
+        const url = route.request().url();
+        const parsed = new URL(url);
+        if (parsed.searchParams.has('code')) {
+          clearTimeout(timer);
+          route.abort().catch(() => {});
+          resolve(parsed.searchParams.get('code')!);
+        } else { route.continue().catch(() => {}); }
+      });
+    });
+
+    // Keep browser open 3s so you can see the final state
+    await new Promise(r => setTimeout(r, 3000));
+    await browser.close();
+
+    console.log('[debug-login] auth code captured:', authCode.slice(0, 8) + '…');
+    return reply.send({ ok: true, auth_code_prefix: authCode.slice(0, 8) });
+  } catch (e: any) {
+    browser?.close?.();
+    console.error('[debug-login error]', e);
     return reply.status(500).send({ error: e.message });
   }
 });

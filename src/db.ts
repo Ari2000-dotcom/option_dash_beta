@@ -159,6 +159,18 @@ export async function saveNubraInstruments(data: string, date: string): Promise<
   });
 }
 
+export async function clearNubraInstruments(): Promise<void> {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(NUBRA_STORE, 'readwrite');
+    const store = tx.objectStore(NUBRA_STORE);
+    store.delete(NUBRA_KEY);
+    store.delete(NUBRA_DATE_KEY);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
 export async function loadNubraInstruments(): Promise<{ data: string; date: string } | null> {
   const db = await openDB();
   return new Promise((resolve, reject) => {
