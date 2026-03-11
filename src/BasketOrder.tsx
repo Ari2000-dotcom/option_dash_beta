@@ -21,6 +21,8 @@ export interface BasketLeg {
   greeks?: BasketLegGreeks;
   refId?: number;
   instrumentKey?: string; // Upstox instrument_key for MCX legs
+  entryDate?: string; // YYYY-MM-DD (historical mode)
+  entryTime?: string; // HH:MM (historical mode)
 }
 
 interface OrderLevel { price: number; quantity: number; num_orders: number; }

@@ -5,6 +5,87 @@
  */
 
 import React, { useState, useEffect, useRef, useMemo, startTransition } from 'react';
+import { format, parse, isValid } from 'date-fns';
+import { Calendar } from './components/ui/calendar';
+import { Popover, PopoverContent, PopoverTrigger } from './components/ui/popover';
+import { ChevronDown, Clock } from 'lucide-react';
+
+// ── Time slots ────────────────────────────────────────────────────────────────
+const TIME_SLOTS = ['09:15','09:30','10:00','10:30','11:00','11:30','12:00','12:30','13:00','13:30','14:00','14:30','15:00','15:15','15:25'];
+
+function CalendarPicker({ date, time, onDateChange, onTimeChange }: {
+  date: string; time: string;
+  onDateChange: (d: string) => void;
+  onTimeChange: (t: string) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const selected = date ? parse(date, 'yyyy-MM-dd', new Date()) : undefined;
+  const displayDate = selected && isValid(selected) ? format(selected, 'dd MMM yyyy') : 'Select date';
+
+  return (
+    <div style={{ borderTop: '1px solid rgba(255,255,255,0.06)', paddingTop: 8, marginTop: 8, display: 'flex', flexDirection: 'column', gap: 6 }}>
+
+      {/* Date row */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+        <span style={{ fontSize: 10, fontWeight: 600, color: '#6B7280', width: 28 }}>Date</span>
+        <Popover open={open} onOpenChange={setOpen}>
+          <PopoverTrigger asChild>
+            <button style={{
+              flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+              background: 'rgba(255,255,255,0.05)', border: '1px solid rgba(255,255,255,0.1)',
+              borderRadius: 6, padding: '4px 8px', cursor: 'pointer', color: date ? '#E2E8F0' : '#6B7280',
+              fontSize: 11, fontWeight: 600,
+            }}>
+              {displayDate}
+              <ChevronDown size={11} color="#6B7280" />
+            </button>
+          </PopoverTrigger>
+          <PopoverContent
+            className="w-auto p-0 overflow-hidden"
+            align="start"
+            style={{ background: '#1a1a1a', border: '1px solid rgba(255,255,255,0.12)', borderRadius: 10, boxShadow: '0 12px 48px rgba(0,0,0,0.8)', zIndex: 99999 }}
+          >
+            <Calendar
+              mode="single"
+              selected={selected}
+              defaultMonth={selected}
+              disabled={{ after: new Date() }}
+              onSelect={(d) => {
+                if (d) { onDateChange(format(d, 'yyyy-MM-dd')); setOpen(false); }
+              }}
+            />
+          </PopoverContent>
+        </Popover>
+      </div>
+
+      {/* Time row */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+        <span style={{ fontSize: 10, fontWeight: 600, color: '#6B7280', width: 28 }}>Time</span>
+        <div style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: 4 }}>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 3 }}>
+            {TIME_SLOTS.map(slot => {
+              const sel = time === slot;
+              return (
+                <button key={slot} onClick={() => onTimeChange(slot)} style={{
+                  padding: '3px 0', borderRadius: 5, fontSize: 10, fontWeight: 600, cursor: 'pointer', textAlign: 'center',
+                  background: sel ? 'rgba(255,152,0,0.18)' : 'rgba(255,255,255,0.03)',
+                  border: sel ? '1px solid rgba(255,152,0,0.6)' : '1px solid rgba(255,255,255,0.08)',
+                  color: sel ? '#FF9800' : '#6B7280',
+                }}>{slot}</button>
+              );
+            })}
+          </div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 4, background: 'rgba(255,255,255,0.03)', border: '1px solid rgba(255,255,255,0.08)', borderRadius: 5, padding: '3px 7px' }}>
+            <Clock size={10} color="#6B7280" />
+            <input type="time" value={time} onChange={e => onTimeChange(e.target.value)}
+              style={{ flex: 1, background: 'transparent', border: 'none', outline: 'none', color: '#E2E8F0', fontSize: 10, fontWeight: 600, minWidth: 0 }} />
+          </div>
+        </div>
+      </div>
+
+    </div>
+  );
+}
 import {
   useReactTable,
   getCoreRowModel,
@@ -100,7 +181,7 @@ interface AddLegPayload {
   entryTime?: string;
 }
 
-function OptionChainNubra({ symbol, expiries, sessionToken, exchange = 'NSE', onClose, onAddLeg, onLtpUpdateRef, lotSize = 1, isHistoricalMode }: {
+function OptionChainNubra({ symbol, expiries, sessionToken, exchange = 'NSE', onClose, onAddLeg, onLtpUpdateRef, lotSize = 1, isHistoricalMode, spotRefId }: {
   symbol: string;
   expiries: (string | number)[];
   sessionToken: string;
@@ -110,6 +191,7 @@ function OptionChainNubra({ symbol, expiries, sessionToken, exchange = 'NSE', on
   onLtpUpdateRef?: React.MutableRefObject<((ltpMap: Map<number, { ce: number; pe: number; ceGreeks: { delta: number; theta: number; vega: number; gamma: number; iv: number }; peGreeks: { delta: number; theta: number; vega: number; gamma: number; iv: number } }>, spot: number, expiry: string) => void) | null>;
   lotSize?: number;
   isHistoricalMode?: boolean;
+  spotRefId?: string;
 }) {
   const [selectedExpiry, setSelectedExpiry] = useState<string | null>(null);
   const [rows, setRows] = useState<OptionRow[]>([]);
@@ -117,35 +199,37 @@ function OptionChainNubra({ symbol, expiries, sessionToken, exchange = 'NSE', on
   const [qty, setQty] = useState(1);
   const [entryDate, setEntryDate] = useState(() => { const d = new Date(); if (d.getHours() < 9 || (d.getHours() === 9 && d.getMinutes() < 15)) { d.setDate(d.getDate() - 1); } return d.toISOString().slice(0, 10); });
   const [entryTime, setEntryTime] = useState('09:15');
+  const [fetching, setFetching] = useState(false);
   const [popup, setPopup] = useState<{ x: number; y: number; strike: number; type: 'CE' | 'PE'; action: 'B' | 'S'; price: number; refId?: number; greeks: { delta: number; theta: number; vega: number; gamma: number; iv: number }; instrumentKey?: string | null; expiry?: string; } | null>(null);
   const openPopup = (p: NonNullable<typeof popup>) => startTransition(() => { setQty(1); setPopup(p); });
   const popupRef = useRef<HTMLDivElement>(null);
   const [atm, setAtm] = useState(0);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [colVis, setColVis] = useState<Record<string, boolean>>({
-    ltp: true, chg: true, oichg: true, oi: true, delta: true, theta: true, gamma: false, vega: false, iv: true,
+    ltp: true, chg: false, oichg: false, oi: true, delta: true, theta: false, gamma: false, vega: false, iv: true,
   });
   const wsRef = useRef<WebSocket | null>(null);
   const tbodyRef = useRef<HTMLTableSectionElement>(null);
   const atmRowRef = useRef<HTMLTableRowElement>(null);
   const shouldScrollToAtm = useRef(true);
+  const scrollRef = useRef<HTMLDivElement>(null);
 
   const ceOverlayRef = useRef<HTMLDivElement>(null);
   const peOverlayRef = useRef<HTMLDivElement>(null);
   const overlayDataRef = useRef<{ strike: number; ceLtp: number; peLtp: number; ceRefId?: number; peRefId?: number; ceGreeks: any; peGreeks: any; } | null>(null);
 
-  const showOverlay = (fixedTop: number, ceFixedLeft: number, peFixedLeft: number, cellW: number, cellH: number, data: NonNullable<typeof overlayDataRef.current>, side?: 'CE' | 'PE') => {
+  const showOverlay = (fixedTop: number, ceFixedLeft: number, ceW: number, peFixedLeft: number, peW: number, cellH: number, data: NonNullable<typeof overlayDataRef.current>, side?: 'CE' | 'PE') => {
     overlayDataRef.current = data;
     const ce = ceOverlayRef.current;
     const pe = peOverlayRef.current;
-    if (ce) { 
+    if (ce) {
       if (side === 'CE' || !side) {
-        ce.style.left = ceFixedLeft + 'px'; ce.style.top = fixedTop + 'px'; ce.style.width = cellW + 'px'; ce.style.height = cellH + 'px'; ce.style.display = 'flex'; 
+        ce.style.left = ceFixedLeft + 'px'; ce.style.top = fixedTop + 'px'; ce.style.width = ceW + 'px'; ce.style.height = cellH + 'px'; ce.style.display = 'flex';
       } else ce.style.display = 'none';
     }
-    if (pe) { 
+    if (pe) {
       if (side === 'PE' || !side) {
-        pe.style.left = peFixedLeft + 'px'; pe.style.top = fixedTop + 'px'; pe.style.width = cellW + 'px'; pe.style.height = cellH + 'px'; pe.style.display = 'flex'; 
+        pe.style.left = peFixedLeft + 'px'; pe.style.top = fixedTop + 'px'; pe.style.width = peW + 'px'; pe.style.height = cellH + 'px'; pe.style.display = 'flex';
       } else pe.style.display = 'none';
     }
   };
@@ -416,6 +500,12 @@ function OptionChainNubra({ symbol, expiries, sessionToken, exchange = 'NSE', on
     return ids.reduce((s, id) => s + (W[id] ?? 72), 0);
   }, [columns]);
 
+  // Auto-scroll right when columns are added
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (el) el.scrollLeft = el.scrollWidth;
+  }, [totalWidth]);
+
   const expLabel = selectedExpiry ? fmtExpiry(selectedExpiry) : '—';
 
   return (
@@ -654,32 +744,29 @@ function OptionChainNubra({ symbol, expiries, sessionToken, exchange = 'NSE', on
                       className={`oc-row ${data.isAtm ? 'oc-row-atm' : ri % 2 === 0 ? 'oc-row-even' : 'oc-row-odd'}`}
                       ref={data.isAtm ? atmRowRef : undefined}
                       style={{ borderBottom: '1px solid rgba(255,255,255,0.10)' }}
-                      onMouseEnter={e => {
-                        if (popup) return;
-                        const tr = e.currentTarget;
-                        const rct = tr.getBoundingClientRect();
-                        const strikeCell = tr.querySelector('.oc-strike-cell');
-                        const strikeCenter = strikeCell ? (strikeCell.getBoundingClientRect().left + strikeCell.getBoundingClientRect().right) / 2 : rct.left + rct.width / 2;
-                        const side = e.clientX < strikeCenter ? 'CE' : 'PE';
-                        showOverlay(rct.top, rct.left + 54, rct.right - 128 - 54, rct.width / 2 - 40, rct.height, {
-                          strike: data.strike, ceLtp: data.ce.ltp, peLtp: data.pe.ltp, ceRefId: data.ce.ref_id ?? 0, peRefId: data.pe.ref_id ?? 0,
-                          ceGreeks: { delta: data.ce.delta, theta: data.ce.theta, vega: data.ce.vega, gamma: data.ce.gamma, iv: data.ce.iv },
-                          peGreeks: { delta: data.pe.delta, theta: data.pe.theta, vega: data.pe.vega, gamma: data.pe.gamma, iv: data.pe.iv }
-                        }, side);
-                      }}
                       onMouseMove={e => {
                         if (popup) return;
                         const tr = e.currentTarget;
-                        const rct = tr.getBoundingClientRect();
-                        const strikeCell = tr.querySelector('.oc-strike-cell');
-                        const strikeCenter = strikeCell ? (strikeCell.getBoundingClientRect().left + strikeCell.getBoundingClientRect().right) / 2 : rct.left + rct.width / 2;
-                        const side = e.clientX < strikeCenter ? 'CE' : 'PE';
-                        showOverlay(rct.top, rct.left + 54, rct.right - 128 - 54, rct.width / 2 - 40, rct.height, {
+                        const strikeTd = (tr.querySelector('td[data-col="strike"]') || tr.querySelector('td[data-col="mstrike"]')) as HTMLElement | null;
+                        if (!strikeTd) return;
+                        const ceLtpTd = strikeTd.previousElementSibling as HTMLElement | null;
+                        const peLtpTd = strikeTd.nextElementSibling as HTMLElement | null;
+                        const ceR = ceLtpTd?.getBoundingClientRect();
+                        const peR = peLtpTd?.getBoundingClientRect();
+                        if (!ceR || !peR) return;
+                        // only show when mouse is over CE LTP or PE LTP cell
+                        const overCe = e.clientX >= ceR.left && e.clientX <= ceR.right;
+                        const overPe = e.clientX >= peR.left && e.clientX <= peR.right;
+                        if (!overCe && !overPe) { hideOverlay(); return; }
+                        const side = overCe ? 'CE' : 'PE';
+                        const trR = tr.getBoundingClientRect();
+                        showOverlay(trR.top, ceR.left, ceR.width, peR.left, peR.width, trR.height, {
                           strike: data.strike, ceLtp: data.ce.ltp, peLtp: data.pe.ltp, ceRefId: data.ce.ref_id ?? 0, peRefId: data.pe.ref_id ?? 0,
                           ceGreeks: { delta: data.ce.delta, theta: data.ce.theta, vega: data.ce.vega, gamma: data.ce.gamma, iv: data.ce.iv },
                           peGreeks: { delta: data.pe.delta, theta: data.pe.theta, vega: data.pe.vega, gamma: data.pe.gamma, iv: data.pe.iv }
                         }, side);
                       }}
+                      onMouseLeave={e => { const rel = e.relatedTarget as HTMLElement | null; if (rel instanceof HTMLElement && (rel.closest('.oc-bs-overlay') || rel.closest('.oc-row'))) return; hideOverlay(); }}
                     >
                       {row.getVisibleCells().map(cell => {
                         const id = cell.column.id;
@@ -692,7 +779,7 @@ function OptionChainNubra({ symbol, expiries, sessionToken, exchange = 'NSE', on
                           ? 'rgba(210,130,0,0.28)'      // Bloomberg amber/orange — PE ITM
                           : undefined;
                         return (
-                          <td key={cell.id} className={isStrike ? 'oc-strike-cell' : ''} style={{
+                          <td key={cell.id} data-col={id} className={isStrike ? 'oc-strike-cell' : ''} style={{
                             width: W[id], minWidth: W[id], padding: '8px 10px',
                             fontSize: 13, fontWeight: id==='strike' ? 700 : 500, fontFamily: '-apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif',
                             textAlign: isStrike ? 'center' : isCe ? 'right' : 'left',
@@ -712,15 +799,13 @@ function OptionChainNubra({ symbol, expiries, sessionToken, exchange = 'NSE', on
         )}
       </div>
 
-      <div ref={ceOverlayRef} className="oc-bs-overlay" style={{ display: 'none', position: 'fixed', left: 0, top: 0 }}
-        onMouseLeave={e => { const rel = e.relatedTarget as HTMLElement | null; if (typeof rel?.closest === 'function' && (rel.closest('.oc-row') || rel.closest('.oc-bs-overlay'))) return; hideOverlay(); }}>
-        <button className="oc-btn oc-btn-b" onMouseDown={e => { e.stopPropagation(); const d = overlayDataRef.current; if (!d) return; const r = (e.target as HTMLElement).getBoundingClientRect(); hideOverlay(); openPopup({ x: r.left + r.width / 2, y: r.bottom + 6, strike: d.strike, type: 'CE', action: 'B', price: d.ceLtp, refId: d.ceRefId, greeks: d.ceGreeks }); }}>B</button>
-        <button className="oc-btn oc-btn-s" onMouseDown={e => { e.stopPropagation(); const d = overlayDataRef.current; if (!d) return; const r = (e.target as HTMLElement).getBoundingClientRect(); hideOverlay(); openPopup({ x: r.left + r.width / 2, y: r.bottom + 6, strike: d.strike, type: 'CE', action: 'S', price: d.ceLtp, refId: d.ceRefId, greeks: d.ceGreeks }); }}>S</button>
+      <div ref={ceOverlayRef} className="oc-bs-overlay" style={{ display: 'none', position: 'fixed', left: 0, top: 0, pointerEvents: 'none' }}>
+        <button className="oc-btn oc-btn-b" style={{ pointerEvents: 'auto' }} onMouseDown={e => { e.stopPropagation(); const d = overlayDataRef.current; if (!d) return; const r = (e.target as HTMLElement).getBoundingClientRect(); hideOverlay(); openPopup({ x: r.left + r.width / 2, y: r.bottom + 6, strike: d.strike, type: 'CE', action: 'B', price: d.ceLtp, refId: d.ceRefId, greeks: d.ceGreeks }); }}>B</button>
+        <button className="oc-btn oc-btn-s" style={{ pointerEvents: 'auto' }} onMouseDown={e => { e.stopPropagation(); const d = overlayDataRef.current; if (!d) return; const r = (e.target as HTMLElement).getBoundingClientRect(); hideOverlay(); openPopup({ x: r.left + r.width / 2, y: r.bottom + 6, strike: d.strike, type: 'CE', action: 'S', price: d.ceLtp, refId: d.ceRefId, greeks: d.ceGreeks }); }}>S</button>
       </div>
-      <div ref={peOverlayRef} className="oc-bs-overlay" style={{ display: 'none', position: 'fixed', left: 0, top: 0 }}
-        onMouseLeave={e => { const rel = e.relatedTarget as HTMLElement | null; if (typeof rel?.closest === 'function' && (rel.closest('.oc-row') || rel.closest('.oc-bs-overlay'))) return; hideOverlay(); }}>
-        <button className="oc-btn oc-btn-b" onMouseDown={e => { e.stopPropagation(); const d = overlayDataRef.current; if (!d) return; const r = (e.target as HTMLElement).getBoundingClientRect(); hideOverlay(); openPopup({ x: r.left + r.width / 2, y: r.bottom + 6, strike: d.strike, type: 'PE', action: 'B', price: d.peLtp, refId: d.peRefId, greeks: d.peGreeks }); }}>B</button>
-        <button className="oc-btn oc-btn-s" onMouseDown={e => { e.stopPropagation(); const d = overlayDataRef.current; if (!d) return; const r = (e.target as HTMLElement).getBoundingClientRect(); hideOverlay(); openPopup({ x: r.left + r.width / 2, y: r.bottom + 6, strike: d.strike, type: 'PE', action: 'S', price: d.peLtp, refId: d.peRefId, greeks: d.peGreeks }); }}>S</button>
+      <div ref={peOverlayRef} className="oc-bs-overlay" style={{ display: 'none', position: 'fixed', left: 0, top: 0, pointerEvents: 'none' }}>
+        <button className="oc-btn oc-btn-b" style={{ pointerEvents: 'auto' }} onMouseDown={e => { e.stopPropagation(); const d = overlayDataRef.current; if (!d) return; const r = (e.target as HTMLElement).getBoundingClientRect(); hideOverlay(); openPopup({ x: r.left + r.width / 2, y: r.bottom + 6, strike: d.strike, type: 'PE', action: 'B', price: d.peLtp, refId: d.peRefId, greeks: d.peGreeks }); }}>B</button>
+        <button className="oc-btn oc-btn-s" style={{ pointerEvents: 'auto' }} onMouseDown={e => { e.stopPropagation(); const d = overlayDataRef.current; if (!d) return; const r = (e.target as HTMLElement).getBoundingClientRect(); hideOverlay(); openPopup({ x: r.left + r.width / 2, y: r.bottom + 6, strike: d.strike, type: 'PE', action: 'S', price: d.peLtp, refId: d.peRefId, greeks: d.peGreeks }); }}>S</button>
       </div>
 
       {/* Qty popup */}
@@ -733,8 +818,10 @@ function OptionChainNubra({ symbol, expiries, sessionToken, exchange = 'NSE', on
           <div ref={popupRef} style={{
             position: 'fixed', left: popup.x, top: popup.y, transform: 'translateX(-50%)',
             zIndex: 9999, background: '#1a1a1a', border: `1px solid ${accentBorder}`,
-            borderRadius: 10, padding: '10px 12px', boxShadow: '0 8px 32px rgba(0,0,0,0.6)',
-            display: 'flex', flexDirection: 'column', gap: 8, minWidth: 160,
+            borderRadius: 12, padding: '12px 14px', boxShadow: '0 12px 48px rgba(0,0,0,0.7)',
+            display: 'flex', flexDirection: 'column', gap: 8,
+            width: isHistoricalMode ? 240 : 180,
+            maxHeight: 'calc(100vh - 40px)', overflowY: 'auto',
           }}>
             {/* Header */}
             <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
@@ -759,24 +846,94 @@ function OptionChainNubra({ symbol, expiries, sessionToken, exchange = 'NSE', on
                 <button onClick={() => setQty(q => q + 1)} style={{ width: 26, height: 26, background: 'transparent', border: 'none', color: '#9CA3AF', cursor: 'pointer', fontSize: 16, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>+</button>
               </div>
             </div>
-            {/* Historical inputs */}
+            {/* Historical calendar + time picker */}
             {isHistoricalMode && (
-              <div style={{ display: 'flex', flexDirection: 'column', gap: 6, marginTop: 4 }}>
-                <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-                  <span style={{ fontSize: 11, color: '#6B7280', fontWeight: 600, flex: 1 }}>Date</span>
-                  <input type="date" value={entryDate} onChange={e => setEntryDate(e.target.value)} style={{ width: 100, background: 'rgba(255,255,255,0.05)', border: '1px solid rgba(255,255,255,0.1)', borderRadius: 6, padding: '2px 6px', color: '#E2E8F0', fontSize: 12, outline: 'none' }} />
-                </div>
-                <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-                  <span style={{ fontSize: 11, color: '#6B7280', fontWeight: 600, flex: 1 }}>Time</span>
-                  <input type="time" value={entryTime} onChange={e => setEntryTime(e.target.value)} style={{ width: 80, background: 'rgba(255,255,255,0.05)', border: '1px solid rgba(255,255,255,0.1)', borderRadius: 6, padding: '2px 6px', color: '#E2E8F0', fontSize: 12, outline: 'none' }} />
-                </div>
-              </div>
+              <CalendarPicker
+                date={entryDate}
+                time={entryTime}
+                onDateChange={setEntryDate}
+                onTimeChange={setEntryTime}
+              />
             )}
             {/* Confirm */}
-            <button onClick={() => { onAddLeg?.({ symbol, expiry: selectedExpiry!, strike: popup.strike, type: popup.type, action: popup.action, price: popup.price, lots: qty, lotSize, refId: popup.refId, greeks: popup.greeks, entryDate: isHistoricalMode ? entryDate : undefined, entryTime: isHistoricalMode ? entryTime : undefined }); setPopup(null); }} style={{
-              padding: '6px 0', borderRadius: 7, background: accentBg, border: `1px solid ${accentBorder}`,
-              color: accentColor, fontSize: 12, fontWeight: 700, cursor: 'pointer', letterSpacing: '0.04em',
-            }}>Add to Basket</button>
+            <button disabled={fetching} onClick={async () => {
+              if (!isHistoricalMode) {
+                onAddLeg?.({ symbol, expiry: selectedExpiry!, strike: popup.strike, type: popup.type, action: popup.action, price: popup.price, lots: qty, lotSize, refId: popup.refId, greeks: popup.greeks });
+                setPopup(null);
+                return;
+              }
+              // Historical mode: fetch close price at entryDate+entryTime from Nubra
+              setFetching(true);
+              try {
+                const candleTs = new Date(`${entryDate}T${entryTime}:00+05:30`).getTime();
+                // startDate = day before at 09:15 IST in UTC, endDate = entry time IST in UTC
+                const startUtc = new Date(`${entryDate}T03:45:00Z`).toISOString();
+                const endUtc = new Date(`${entryDate}T${entryTime}:00+05:30`).toISOString();
+
+                // Build NSE option instrument name: e.g. NIFTY2631724500CE
+                // selectedExpiry format: "20260317" (YYYYMMDD) → YY=26, M=3, DD=17
+                const buildOptName = (exp: string) => {
+                  const yy = exp.slice(2, 4);   // "26"
+                  const m = String(parseInt(exp.slice(4, 6)));  // "3" (no leading zero)
+                  const dd = exp.slice(6, 8);   // "17"
+                  return `${symbol}${yy}${m}${dd}${popup.strike}${popup.type}`;
+                };
+                const optName = buildOptName(selectedExpiry ?? '');
+
+                const fetchClose = async (nubraType: string, value: string) => {
+                  const res = await fetch('/api/nubra-historical', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                      session_token: sessionToken,
+                      exchange,
+                      type: nubraType,
+                      values: [value],
+                      fields: ['close'],
+                      startDate: startUtc,
+                      endDate: endUtc,
+                      interval: '1m',
+                      intraDay: false,
+                    }),
+                  });
+                  const json = await res.json();
+                  // Response: { result: [ { values: [ { "NIFTY...CE": { close: [{ts,v}] } } ] } ] }
+                  const valuesArr: any[] = json?.result?.[0]?.values ?? [];
+                  let stockChart: any = null;
+                  for (const dict of valuesArr) {
+                    for (const v of Object.values(dict)) { stockChart = v; break; }
+                    if (stockChart) break;
+                  }
+                  if (!stockChart) return null;
+                  const closeArr: { ts: number; v: number }[] = stockChart.close ?? [];
+                  if (!closeArr.length) return null;
+                  // ts is nanoseconds — find candle closest to entryTime
+                  let best = closeArr[closeArr.length - 1];
+                  let bestDiff = Infinity;
+                  for (const c of closeArr) {
+                    const diff = Math.abs(c.ts / 1e6 - candleTs);
+                    if (diff < bestDiff) { bestDiff = diff; best = c; }
+                  }
+                  return best.v / 100;
+                };
+
+                const optionClose = optName ? await fetchClose('OPT', optName) : null;
+                const spotClose = spotRefId ? await fetchClose('INDEX', symbol) : null;
+                const entryPrice = optionClose ?? popup.price;
+                const entrySpotPrice = spotClose ?? spot;
+                onAddLeg?.({ symbol, expiry: selectedExpiry!, strike: popup.strike, type: popup.type, action: popup.action, price: entryPrice, lots: qty, lotSize, refId: popup.refId, greeks: popup.greeks, entryDate, entryTime, entrySpot: entrySpotPrice } as any);
+                setPopup(null);
+              } catch {
+                // fallback to current price on error
+                onAddLeg?.({ symbol, expiry: selectedExpiry!, strike: popup.strike, type: popup.type, action: popup.action, price: popup.price, lots: qty, lotSize, refId: popup.refId, greeks: popup.greeks, entryDate, entryTime } as any);
+                setPopup(null);
+              } finally {
+                setFetching(false);
+              }
+            }} style={{
+              padding: '6px 0', borderRadius: 7, background: fetching ? 'rgba(255,255,255,0.05)' : accentBg, border: `1px solid ${accentBorder}`,
+              color: fetching ? '#6B7280' : accentColor, fontSize: 12, fontWeight: 700, cursor: fetching ? 'not-allowed' : 'pointer', letterSpacing: '0.04em',
+            }}>{fetching ? 'Fetching price…' : 'Add to Basket'}</button>
           </div>
         );
       })()}
@@ -970,6 +1127,16 @@ function OptionChainMCX({ symbol, instruments, onClose, onAddLeg, lotSize = 1, o
   const [qty, setQty] = useState(1);
   const [popup, setPopup] = useState<{ x: number; y: number; strike: number; type: 'CE' | 'PE'; action: 'B' | 'S'; price: number; instrumentKey: string | null; greeks: { delta: number; theta: number; vega: number; gamma: number; iv: number } } | null>(null);
   const popupRef = useRef<HTMLDivElement>(null);
+  const ceOverlayRef = useRef<HTMLDivElement>(null);
+  const peOverlayRef = useRef<HTMLDivElement>(null);
+  const overlayDataRef = useRef<{ strike: number; ceLtp: number; peLtp: number; ceKey: string | null; peKey: string | null; ceGreeks: any; peGreeks: any } | null>(null);
+  const showOverlay = (fixedTop: number, ceFixedLeft: number, ceW: number, peFixedLeft: number, peW: number, cellH: number, data: NonNullable<typeof overlayDataRef.current>, side?: 'CE' | 'PE') => {
+    overlayDataRef.current = data;
+    const ce = ceOverlayRef.current; const pe = peOverlayRef.current;
+    if (ce) { if (side === 'CE' || !side) { ce.style.left = ceFixedLeft + 'px'; ce.style.top = fixedTop + 'px'; ce.style.width = ceW + 'px'; ce.style.height = cellH + 'px'; ce.style.display = 'flex'; } else ce.style.display = 'none'; }
+    if (pe) { if (side === 'PE' || !side) { pe.style.left = peFixedLeft + 'px'; pe.style.top = fixedTop + 'px'; pe.style.width = peW + 'px'; pe.style.height = cellH + 'px'; pe.style.display = 'flex'; } else pe.style.display = 'none'; }
+  };
+  const hideOverlay = () => { const ce = ceOverlayRef.current; const pe = peOverlayRef.current; if (ce) ce.style.display = 'none'; if (pe) pe.style.display = 'none'; };
   useEffect(() => {
     if (!popup) return;
     const h = (e: MouseEvent) => { if (popupRef.current && !popupRef.current.contains(e.target as Node)) setPopup(null); };
@@ -1198,16 +1365,26 @@ function OptionChainMCX({ symbol, instruments, onClose, onAddLeg, lotSize = 1, o
                       ref={data.isAtm ? atmRowRef : undefined}
                       style={{ borderBottom: '1px solid rgba(255,255,255,0.10)' }}
                       onMouseMove={e => {
+                        if (popup) return;
                         const tr = e.currentTarget;
-                        const rct = tr.getBoundingClientRect();
-                        const strikeCell = tr.querySelector('.oc-strike-cell');
-                        const strikeCenter = strikeCell ? (strikeCell.getBoundingClientRect().left + strikeCell.getBoundingClientRect().right) / 2 : rct.left + rct.width / 2;
-                        const side = e.clientX < strikeCenter ? 'CE' : 'PE';
-                        tr.setAttribute('data-hover-side', side);
+                        const strikeTd = tr.querySelector('td[data-col="mstrike"]') as HTMLElement | null;
+                        if (!strikeTd) return;
+                        const strikeR = strikeTd.getBoundingClientRect();
+                        if (e.clientX >= strikeR.left && e.clientX <= strikeR.right) { hideOverlay(); return; }
+                        const side = e.clientX < strikeR.left ? 'CE' : 'PE';
+                        const ceLtpTd = strikeTd.previousElementSibling as HTMLElement | null;
+                        const peLtpTd = strikeTd.nextElementSibling as HTMLElement | null;
+                        const ceR = ceLtpTd?.getBoundingClientRect();
+                        const peR = peLtpTd?.getBoundingClientRect();
+                        const trR = tr.getBoundingClientRect();
+                        if (!ceR || !peR) return;
+                        showOverlay(trR.top, ceR.left, ceR.width, peR.left, peR.width, trR.height, {
+                          strike: data.strike, ceLtp: data.ce.ltp, peLtp: data.pe.ltp, ceKey: data.ceKey, peKey: data.peKey,
+                          ceGreeks: { delta: data.ce.delta, theta: data.ce.theta, vega: data.ce.vega, gamma: data.ce.gamma, iv: data.ce.iv },
+                          peGreeks: { delta: data.pe.delta, theta: data.pe.theta, vega: data.pe.vega, gamma: data.pe.gamma, iv: data.pe.iv }
+                        }, side);
                       }}
-                      onMouseLeave={e => {
-                        e.currentTarget.removeAttribute('data-hover-side');
-                      }}
+                      onMouseLeave={e => { const rel = e.relatedTarget as HTMLElement | null; if (rel instanceof HTMLElement && (rel.closest('.oc-bs-overlay') || rel.closest('.oc-row'))) return; hideOverlay(); }}
                     >
                       {row.getVisibleCells().map(cell => {
                         const id = cell.column.id;
@@ -1215,7 +1392,7 @@ function OptionChainMCX({ symbol, instruments, onClose, onAddLeg, lotSize = 1, o
                         const isCe = MCX_CE_COLS.includes(id);
                         const cellBg = isCe && isCeItm ? 'rgba(0,168,132,0.18)' : !isCe && !isStrike && isPeItm ? 'rgba(210,130,0,0.28)' : undefined;
                         return (
-                          <td key={cell.id} className={isStrike ? 'oc-strike-cell' : ''} style={{ width: MW[id], minWidth: MW[id], padding: '8px 10px', fontSize: 13, fontWeight: id === 'mstrike' ? 700 : 500, fontFamily: '-apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif', textAlign: isStrike ? 'center' : isCe ? 'right' : 'left', whiteSpace: 'nowrap', ...(cellBg ? { background: cellBg } : isStrike ? { background: '#333333' } : {}) }}>
+                          <td key={cell.id} data-col={id} className={isStrike ? 'oc-strike-cell' : ''} style={{ width: MW[id], minWidth: MW[id], padding: '8px 10px', fontSize: 13, fontWeight: id === 'mstrike' ? 700 : 500, fontFamily: '-apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif', textAlign: isStrike ? 'center' : isCe ? 'right' : 'left', whiteSpace: 'nowrap', ...(cellBg ? { background: cellBg } : isStrike ? { background: '#333333' } : {}) }}>
                             {flexRender(cell.column.columnDef.cell, cell.getContext())}
                           </td>
                         );
@@ -1227,6 +1404,15 @@ function OptionChainMCX({ symbol, instruments, onClose, onAddLeg, lotSize = 1, o
             </tbody>
           </table>
         )}
+      </div>
+
+      <div ref={ceOverlayRef} className="oc-bs-overlay" style={{ display: 'none', position: 'fixed', left: 0, top: 0, pointerEvents: 'none' }}>
+        <button className="oc-btn oc-btn-b" style={{ pointerEvents: 'auto' }} onMouseDown={e => { e.stopPropagation(); const d = overlayDataRef.current; if (!d) return; const r = (e.target as HTMLElement).getBoundingClientRect(); hideOverlay(); setQty(1); setPopup({ x: r.left + r.width / 2, y: r.bottom + 6, strike: d.strike, type: 'CE', action: 'B', price: d.ceLtp, instrumentKey: d.ceKey, greeks: d.ceGreeks }); }}>B</button>
+        <button className="oc-btn oc-btn-s" style={{ pointerEvents: 'auto' }} onMouseDown={e => { e.stopPropagation(); const d = overlayDataRef.current; if (!d) return; const r = (e.target as HTMLElement).getBoundingClientRect(); hideOverlay(); setQty(1); setPopup({ x: r.left + r.width / 2, y: r.bottom + 6, strike: d.strike, type: 'CE', action: 'S', price: d.ceLtp, instrumentKey: d.ceKey, greeks: d.ceGreeks }); }}>S</button>
+      </div>
+      <div ref={peOverlayRef} className="oc-bs-overlay" style={{ display: 'none', position: 'fixed', left: 0, top: 0, pointerEvents: 'none' }}>
+        <button className="oc-btn oc-btn-b" style={{ pointerEvents: 'auto' }} onMouseDown={e => { e.stopPropagation(); const d = overlayDataRef.current; if (!d) return; const r = (e.target as HTMLElement).getBoundingClientRect(); hideOverlay(); setQty(1); setPopup({ x: r.left + r.width / 2, y: r.bottom + 6, strike: d.strike, type: 'PE', action: 'B', price: d.peLtp, instrumentKey: d.peKey, greeks: d.peGreeks }); }}>B</button>
+        <button className="oc-btn oc-btn-s" style={{ pointerEvents: 'auto' }} onMouseDown={e => { e.stopPropagation(); const d = overlayDataRef.current; if (!d) return; const r = (e.target as HTMLElement).getBoundingClientRect(); hideOverlay(); setQty(1); setPopup({ x: r.left + r.width / 2, y: r.bottom + 6, strike: d.strike, type: 'PE', action: 'S', price: d.peLtp, instrumentKey: d.peKey, greeks: d.peGreeks }); }}>S</button>
       </div>
 
       {/* Qty popup — same as Nubra */}
@@ -1262,7 +1448,7 @@ function OptionChainMCX({ symbol, instruments, onClose, onAddLeg, lotSize = 1, o
 }
 
 // ── Dispatcher — routes MCX to Upstox panel, rest to Nubra ───────────────────
-export default function OptionChain({ symbol, expiries, sessionToken, exchange = 'NSE', onClose, onAddLeg, onLtpUpdateRef, lotSize = 1, instruments = [], ocSpotRef }: {
+export default function OptionChain({ symbol, expiries, sessionToken, exchange = 'NSE', onClose, onAddLeg, onLtpUpdateRef, lotSize = 1, instruments = [], ocSpotRef, isHistoricalMode, spotRefId }: {
   symbol: string;
   expiries: (string | number)[];
   sessionToken: string;
@@ -1273,9 +1459,11 @@ export default function OptionChain({ symbol, expiries, sessionToken, exchange =
   lotSize?: number;
   instruments?: Instrument[];
   ocSpotRef?: { current: number };
+  isHistoricalMode?: boolean;
+  spotRefId?: string;
 }) {
   if (exchange === 'MCX') {
     return <OptionChainMCX symbol={symbol} instruments={instruments} onClose={onClose} onAddLeg={onAddLeg} lotSize={lotSize} ocSpotRef={ocSpotRef} />;
   }
-  return <OptionChainNubra symbol={symbol} expiries={expiries} sessionToken={sessionToken} exchange={exchange} onClose={onClose} onAddLeg={onAddLeg} onLtpUpdateRef={onLtpUpdateRef} lotSize={lotSize} />;
+  return <OptionChainNubra symbol={symbol} expiries={expiries} sessionToken={sessionToken} exchange={exchange} onClose={onClose} onAddLeg={onAddLeg} onLtpUpdateRef={onLtpUpdateRef} lotSize={lotSize} isHistoricalMode={isHistoricalMode} spotRefId={spotRefId} />;
 }

@@ -736,13 +736,15 @@ app.post('/api/nubra-historical', async (req, reply) => {
 
   // REST API: POST https://api.nubra.io/charts/timeseries
   // Body is { query: [ { exchange, type, values, fields, startDate, endDate, interval, intraDay, realTime } ] }
+  // Nubra expects RFC3339 datetime — append T00:00:00Z if only a date was passed
+  const toDateTime = (d: string) => /T/.test(d) ? d : `${d}T00:00:00Z`;
   const queryItem = {
     exchange,
     type,
     values,
     fields,
-    startDate,
-    endDate,
+    startDate: toDateTime(startDate),
+    endDate: toDateTime(endDate),
     interval,
     intraDay: intraDay ?? false,
     realTime: true,

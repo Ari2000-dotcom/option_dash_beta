@@ -36,6 +36,7 @@ interface StrategyChartProps {
   ocExchange: string;
   nubraInstruments: NubraInstrument[];
   nubraIndexes: Record<string, string>[];
+  isHistoricalMode?: boolean;
 }
 
 interface SeriesSet {
@@ -138,12 +139,20 @@ async function nubraPost(body: object): Promise<any> {
 }
 
 // Build Nubra date params: today → intraDay:true, historical → explicit range
-function buildDateParams(date: string, today: string) {
+// entryTimeIst: "HH:MM" — when provided on the entry date, startDate begins at that time
+function buildDateParams(date: string, today: string, entryTimeIst?: string) {
   const isToday = date === today;
+  let startDate = isToday ? '' : `${date}T03:45:00.000Z`;
+  if (!isToday && entryTimeIst) {
+    // Convert IST HH:MM to UTC ISO string
+    const [hh, mm] = entryTimeIst.split(':').map(Number);
+    const utcMs = Date.UTC(...(date.split('-').map(Number) as [number, number, number])) + (hh * 60 + mm - 330) * 60000;
+    startDate = new Date(utcMs).toISOString();
+  }
   return {
-    startDate: isToday ? '' : `${date}T03:45:00.000Z`,
-    endDate:   isToday ? '' : `${date}T11:30:00.000Z`,
-    intraDay:  isToday,
+    startDate,
+    endDate: isToday ? '' : `${date}T11:30:00.000Z`,
+    intraDay: isToday,
   };
 }
 
@@ -154,8 +163,9 @@ async function fetchUnderlyingForDate(
   nubraType: string,
   date: string,
   today: string,
+  entryTimeIst?: string,
 ): Promise<LineData[]> {
-  const { startDate, endDate, intraDay } = buildDateParams(date, today);
+  const { startDate, endDate, intraDay } = buildDateParams(date, today, entryTimeIst);
   console.log('[StrategyChart] fetchUnderlying', { nubraSymbol, nubraType, exchange, date, intraDay });
   const chart = await nubraPost({
     exchange, type: nubraType, values: [nubraSymbol], fields: ['close'],
@@ -175,8 +185,9 @@ async function fetchOptionCloseForDate(
   exchange: string,
   date: string,
   today: string,
+  entryTimeIst?: string,
 ): Promise<{ close: LineData[] }> {
-  const { startDate, endDate, intraDay } = buildDateParams(date, today);
+  const { startDate, endDate, intraDay } = buildDateParams(date, today, entryTimeIst);
   const chart = await nubraPost({
     exchange, type: 'OPT', values: [symbol], fields: ['close'],
     startDate, endDate, interval: '1m', intraDay,
@@ -195,8 +206,9 @@ async function fetchOptionGreeksForDate(
   exchange: string,
   date: string,
   today: string,
+  entryTimeIst?: string,
 ): Promise<{ delta: LineData[]; iv: LineData[] }> {
-  const { startDate, endDate, intraDay } = buildDateParams(date, today);
+  const { startDate, endDate, intraDay } = buildDateParams(date, today, entryTimeIst);
   const chart = await nubraPost({
     exchange, type: 'OPT', values: [symbol], fields: ['delta', 'iv_mid'],
     startDate, endDate, interval: '1m', intraDay,
@@ -228,7 +240,7 @@ function optionColor(type: 'CE' | 'PE', idx: number) {
 
 // ── Main ──────────────────────────────────────────────────────────────────────
 
-export default function StrategyChart({ legs, ocSymbol, ocExchange, nubraInstruments, nubraIndexes }: StrategyChartProps) {
+export default function StrategyChart({ legs, ocSymbol, ocExchange, nubraInstruments, nubraIndexes, isHistoricalMode }: StrategyChartProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const chartRef     = useRef<IChartApi | null>(null);
   const seriesRef    = useRef<SeriesSet>({
@@ -645,10 +657,18 @@ export default function StrategyChart({ legs, ocSymbol, ocExchange, nubraInstrum
     let gotAny = false;
     const acc = accumRef.current;
 
+    // In historical mode, pass entry time so fetch starts from that time (not 9:15)
+    const entryDate = isHistoricalMode
+      ? (uniqueLegs.map(l => l.entryDate).filter(Boolean).sort().at(-1) ?? today)
+      : today;
+    const entryTimeIst = (isHistoricalMode && date === entryDate)
+      ? uniqueLegs.map(l => l.entryTime).filter(Boolean).sort().at(-1)
+      : undefined;
+
     await Promise.all([
       // Underlying via Nubra (INDEX or STOCK)
       underlying
-        ? fetchUnderlyingForDate(underlying.symbol, underlying.exchange, underlying.nubraType, date, today)
+        ? fetchUnderlyingForDate(underlying.symbol, underlying.exchange, underlying.nubraType, date, today, entryTimeIst)
             .then(data => {
               if (data.length) {
                 gotAny = true;
@@ -660,7 +680,7 @@ export default function StrategyChart({ legs, ocSymbol, ocExchange, nubraInstrum
 
       // Each option: close only — Greeks loaded lazily on toggle
       ...legInfos.map(({ key, symbol, exchange }) =>
-        fetchOptionCloseForDate(symbol, exchange, date, today)
+        fetchOptionCloseForDate(symbol, exchange, date, today, entryTimeIst)
           .then(({ close }) => {
             if (close.length) {
               gotAny = true;
@@ -674,16 +694,18 @@ export default function StrategyChart({ legs, ocSymbol, ocExchange, nubraInstrum
 
     // Recompute MTM fresh from ALL accumulated option data
     if (gotAny && legInfos.length > 0) {
-      // Only filter by entry time on today's date — historical days show full MTM
+      // Filter by entry time on today's date OR on the historical entry date
       let entryUnix = 0;
-      if (date === today) {
+      const entryDate = isHistoricalMode
+        ? (uniqueLegs.map(l => l.entryDate).filter(Boolean).sort().at(-1) ?? today)
+        : today;
+      if (date === today || (isHistoricalMode && date === entryDate)) {
         for (const { key } of legInfos) {
           const leg = uniqueLegs.find(l => `${l.strike}${l.type}:${l.expiry}` === key);
           if (!leg?.entryTime) continue;
           const [hh, mm] = leg.entryTime.split(':').map(Number);
           const [yr, mo, dy] = date.split('-').map(Number);
           const midnightUtc = Date.UTC(yr, mo - 1, dy) / 1000;
-          // Floor to minute — candles are at :00 second boundaries
           const legUnix = midnightUtc + hh * 3600 + mm * 60 - 5.5 * 3600;
           if (legUnix > entryUnix) entryUnix = legUnix;
         }
@@ -720,7 +742,7 @@ export default function StrategyChart({ legs, ocSymbol, ocExchange, nubraInstrum
     }
 
     return gotAny;
-  }, [uniqueLegs]);
+  }, [uniqueLegs, isHistoricalMode]);
 
   // ── Initial load: today only via Nubra ───────────────────────────────────────
   const fetchAll = useCallback(async () => {
@@ -750,11 +772,15 @@ export default function StrategyChart({ legs, ocSymbol, ocExchange, nubraInstrum
 
     try {
       const today = lastTradingDay();
-      const got = await fetchDay(today, today, underlying, legInfos, false);
+      // Historical mode: start chart from the last entered leg's date
+      const startDate = isHistoricalMode
+        ? (uniqueLegs.map(l => l.entryDate).filter(Boolean).sort().at(-1) ?? today)
+        : today;
+      const got = await fetchDay(startDate, today, underlying, legInfos, false);
       if (got) {
-        oldestDateRef.current = today;
-        setFromDate(today);
-        setToDate(today);
+        oldestDateRef.current = startDate;
+        setFromDate(startDate);
+        setToDate(startDate);
         flushAccum(false);
       } else {
         errors.push('No data for today — market may not have opened yet');
@@ -765,12 +791,13 @@ export default function StrategyChart({ legs, ocSymbol, ocExchange, nubraInstrum
       if (errors.length) setError(errors[0]);
       setLoading(false);
     }
-  }, [ocSymbol, uniqueLegs, resolveUnderlying, resolveOption, fetchDay, flushAccum]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [ocSymbol, uniqueLegs, resolveUnderlying, resolveOption, fetchDay, flushAccum, isHistoricalMode]); // eslint-disable-line react-hooks/exhaustive-deps
 
   fetchAllRef.current = fetchAll;
 
   // ── loadMore: step back one trading day on scroll-left ────────────────────────
   const loadMore = useCallback(async () => {
+    if (isHistoricalMode) return; // historical mode: entry date is the oldest, never load before it
     if (loadLockRef.current || isLoadingMoreRef.current || !oldestDateRef.current) return;
 
     isLoadingMoreRef.current = true;
@@ -816,7 +843,7 @@ export default function StrategyChart({ legs, ocSymbol, ocExchange, nubraInstrum
       setLoadingMore(false);
       setTimeout(() => { loadLockRef.current = false; }, 800);
     }
-  }, [resolveUnderlying, resolveOption, uniqueLegs, fetchDay]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [resolveUnderlying, resolveOption, uniqueLegs, fetchDay, isHistoricalMode]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // ── Subscribe to scroll: trigger loadMore at left edge ───────────────────────
   useEffect(() => {

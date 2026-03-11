@@ -38,6 +38,14 @@ import {
 } from '@tanstack/react-table';
 import './index.css';
 
+function isMarketOpen(): boolean {
+  const now = new Date();
+  const istMin = ((now.getUTCHours() * 60 + now.getUTCMinutes()) + 330) % 1440;
+  const istDay = new Date(now.getTime() + 330 * 60000);
+  if ([0, 6].includes(istDay.getUTCDay())) return false;
+  return istMin >= 9 * 60 + 15 && istMin < 15 * 60 + 30;
+}
+
 type Page = 'chart' | 'straddle' | 'oiprofile' | 'nubra' | 'backtest' | 'historical' | 'mtm';
 type Tab = 'ALL' | 'Cash' | 'F&O' | 'Currency' | 'Commodity';
 
@@ -809,23 +817,29 @@ function MtmLayout({ visible, workerRef, workerReady, workerModeRef, mtmResultsC
   const [legs, setLegs] = useState<Leg[]>([]);
   const legIdRef = useRef(0);
   const ocSpotRef = useRef(0); // latest spot from option chain feed
+  const currentLtpMapRef = useRef<Map<string, { ce: number; pe: number; ceGreeks: Greeks; peGreeks: Greeks }>>(new Map()); // key: `${expiry}:${strike}`
+  const isHistoricalModeRef = useRef(false);
   const [showGreeks, setShowGreeks] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [layoutTheme, setLayoutTheme] = useState<'theme1' | 'theme2'>('theme1');
   const [isHistoricalMode, setIsHistoricalMode] = useState(false);
+  isHistoricalModeRef.current = isHistoricalMode;
 
   // Register "add basket legs to MTM" function into execBasketRef so App can call it on Execute
   useEffect(() => {
     if (!execBasketRef) return;
     (execBasketRef as React.RefObject<((legs: BasketLeg[]) => void) | null>).current = (basketLegsToAdd: BasketLeg[]) => {
       const now = new Date();
-      const entryDate = new Date(now.getTime() + 5.5 * 3600 * 1000).toISOString().slice(0, 10);
-      const entryTime = now.toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false });
+      const nowDate = new Date(now.getTime() + 5.5 * 3600 * 1000).toISOString().slice(0, 10);
+      const nowTime = now.toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false });
       const ZERO: Greeks = { delta: 0, theta: 0, vega: 0, gamma: 0, iv: 0 };
-      // Single setLegs call so React sees one state update and WS effect re-runs correctly
       setLegs(prev => [
         ...prev,
-        ...basketLegsToAdd.map(bl => ({
+        ...basketLegsToAdd.map(bl => {
+          // Historical mode: use the date/time user selected in OC popup
+          const entryDate = isHistoricalModeRef.current ? (bl.entryDate ?? nowDate) : nowDate;
+          const entryTime = isHistoricalModeRef.current ? (bl.entryTime ?? nowTime) : nowTime;
+          return {
           id: ++legIdRef.current,
           symbol: bl.symbol,
           expiry: bl.expiry,
@@ -840,18 +854,32 @@ function MtmLayout({ visible, workerRef, workerReady, workerModeRef, mtmResultsC
           entrySpot: ocSpotRef.current,
           entryTime,
           entryDate,
-          currLtp: bl.price,
+          currLtp: (() => {
+            if (!isHistoricalModeRef.current) return bl.price;
+            // Historical mode: currLtp = current OC price (what's loaded in OC right now)
+            let entry = currentLtpMapRef.current.get(`${bl.expiry}:${bl.strike}`);
+            if (!entry) {
+              // fuzzy strike match for float precision
+              for (const [k, v] of currentLtpMapRef.current.entries()) {
+                const [kExp, kStrike] = k.split(':');
+                if (kExp === bl.expiry && Math.abs(Number(kStrike) - bl.strike) < 0.01) { entry = v; break; }
+              }
+            }
+            if (!entry) return bl.price;
+            return bl.type === 'CE' ? entry.ce : entry.pe;
+          })(),
           checked: true,
           entryGreeks: bl.greeks ?? ZERO,
           currGreeks: bl.greeks ?? ZERO,
-        })),
+          };
+        }),
       ]);
     };
     return () => { if (execBasketRef) (execBasketRef as React.RefObject<((legs: BasketLeg[]) => void) | null>).current = null; };
   }, [execBasketRef]);
 
   // addLeg: only sends to basket — MTM legs are added on Execute
-  const addLeg = useCallback((leg: { symbol: string; expiry: string; strike: number; type: 'CE' | 'PE'; action: 'B' | 'S'; price: number; lots: number; lotSize: number; refId?: number; instrumentKey?: string; greeks: Greeks }) => {
+  const addLeg = useCallback((leg: { symbol: string; expiry: string; strike: number; type: 'CE' | 'PE'; action: 'B' | 'S'; price: number; lots: number; lotSize: number; refId?: number; instrumentKey?: string; greeks: Greeks; entryDate?: string; entryTime?: string }) => {
     onAddToBasket?.({
       id: Date.now() + Math.random(),
       symbol: leg.symbol,
@@ -865,6 +893,8 @@ function MtmLayout({ visible, workerRef, workerReady, workerModeRef, mtmResultsC
       greeks: leg.greeks,
       refId: leg.refId,
       instrumentKey: leg.instrumentKey,
+      entryDate: leg.entryDate,
+      entryTime: leg.entryTime,
     });
   }, [onAddToBasket]);
 
@@ -885,6 +915,9 @@ function MtmLayout({ visible, workerRef, workerReady, workerModeRef, mtmResultsC
       if (mtmWsRef.current) { mtmWsRef.current.close(); mtmWsRef.current = null; }
       return;
     }
+
+    // Historical mode: only connect WS when market is open
+    if (isHistoricalModeRef.current && !isMarketOpen()) return;
 
     const refIds = Array.from(new Set(legs.map(l => l.refId).filter((id): id is number => id !== undefined)));
     if (refIds.length === 0) return;
@@ -1136,14 +1169,23 @@ function MtmLayout({ visible, workerRef, workerReady, workerModeRef, mtmResultsC
     getCoreRowModel: getCoreRowModel()
   });
 
-  // Called by OptionChain on every data tick — update currLtp + live greeks for matching legs
+  // Called by OptionChain on every data tick
   const onLtpUpdate = useCallback((ltpMap: Map<number, { ce: number; pe: number; ceGreeks: Greeks; peGreeks: Greeks }>, spot: number, chainExpiry: string) => {
     ocSpotRef.current = spot;
+    // Always store latest OC prices so execute can read current price
+    ltpMap.forEach((v, strike) => {
+      currentLtpMapRef.current.set(`${chainExpiry}:${strike}`, v);
+    });
+
+    const marketOpen = isMarketOpen();
+
     setLegs(prev => prev.map(leg => {
-      // Only update legs that match the Option Chain's current expiry
       if (leg.expiry !== chainExpiry) return leg;
 
-      // Try exact match first, then scan for closest key (handles float precision)
+      // Historical mode + market open: WS handles currLtp, skip OC update
+      if (isHistoricalModeRef.current && marketOpen) return leg;
+
+      // Live mode OR historical + market closed: update currLtp from OC
       let entry = ltpMap.get(leg.strike);
       if (!entry) {
         for (const [k, v] of ltpMap.entries()) {
@@ -1153,7 +1195,6 @@ function MtmLayout({ visible, workerRef, workerReady, workerModeRef, mtmResultsC
       if (!entry) return leg;
       const newLtp = leg.type === 'CE' ? entry.ce : entry.pe;
       const newGreeks = leg.type === 'CE' ? entry.ceGreeks : entry.peGreeks;
-      // Set entryGreeks once (when they're still zero)
       const entryGreeks = leg.entryGreeks.delta === 0 && newGreeks.delta !== 0 ? newGreeks : leg.entryGreeks;
       return { ...leg, currLtp: newLtp, currGreeks: newGreeks, entryGreeks };
     }));
@@ -1180,6 +1221,17 @@ function MtmLayout({ visible, workerRef, workerReady, workerModeRef, mtmResultsC
       ((i.asset ?? '').toUpperCase() === sym || (i.nubra_name ?? '').toUpperCase() === sym || (i.stock_name ?? '').toUpperCase() === sym)
     );
     return match?.lot_size ?? 1;
+  }, [ocSymbol, nubraInstruments]);
+
+  // refId of the underlying index/stock for historical spot price fetch
+  const ocSpotRefId = useMemo(() => {
+    if (!ocSymbol) return undefined;
+    const sym = ocSymbol.toUpperCase();
+    const match = nubraInstruments.find(i =>
+      i.option_type === 'N/A' &&
+      ((i.stock_name ?? '').toUpperCase() === sym || (i.nubra_name ?? '').toUpperCase() === sym || (i.asset ?? '').toUpperCase() === sym)
+    );
+    return match?.ref_id;
   }, [ocSymbol, nubraInstruments]);
 
   // Always-fresh refs so handleMtmSearch never has stale closure
@@ -1283,13 +1335,21 @@ const [mtmCursor, setMtmCursor] = useState(0);
   const onMouseDown = useCallback((e: React.MouseEvent) => {
     e.preventDefault();
     dragging.current = true;
+    document.body.style.cursor = 'col-resize';
+    document.body.style.userSelect = 'none';
     const onMove = (ev: MouseEvent) => {
       if (!dragging.current || !containerRef.current) return;
       const rect = containerRef.current.getBoundingClientRect();
       const pct = ((ev.clientX - rect.left) / rect.width) * 100;
-      setLeftPct(Math.min(Math.max(pct, 15), 85));
+      setLeftPct(Math.min(Math.max(pct, 20), 80));
     };
-    const onUp = () => { dragging.current = false; window.removeEventListener('mousemove', onMove); window.removeEventListener('mouseup', onUp); };
+    const onUp = () => {
+      dragging.current = false;
+      document.body.style.cursor = '';
+      document.body.style.userSelect = '';
+      window.removeEventListener('mousemove', onMove);
+      window.removeEventListener('mouseup', onUp);
+    };
     window.addEventListener('mousemove', onMove);
     window.addEventListener('mouseup', onUp);
   }, []);
@@ -1301,14 +1361,13 @@ const [mtmCursor, setMtmCursor] = useState(0);
       style={{ display: visible ? 'flex' : 'none', padding: 12, gap: 12, background: 'var(--bg-base)' }}
     >
       {/* Left panel */}
-      <div style={{ 
-        width: `${leftPct}%`, 
-        background: isHistoricalMode ? 'rgba(255,152,0,0.06)' : '#171717', 
-        borderRadius: isHistoricalMode ? 16 : 10, 
+      <div style={{
+        width: `${leftPct}%`, minWidth: 0, flexShrink: 0,
+        background: isHistoricalMode ? 'rgba(255,152,0,0.06)' : '#171717',
+        borderRadius: isHistoricalMode ? 16 : 10,
         border: isHistoricalMode ? '1.5px solid rgba(255,152,0,0.45)' : '1px solid rgba(255,255,255,0.08)',
         boxShadow: isHistoricalMode ? '0 0 25px rgba(255,152,0,0.1) inset' : 'none',
         display: 'flex', flexDirection: 'column', position: 'relative', overflow: 'hidden', minHeight: 0,
-        transition: 'all 0.3s ease-in-out'
       }}>
         {/* Search bar + dropdown */}
         <div style={{ padding: '7px 10px', position: 'relative', display: 'flex', alignItems: 'center', gap: 8, flexShrink: 0 }}>
@@ -1619,9 +1678,9 @@ const [mtmCursor, setMtmCursor] = useState(0);
       {ocOpen && ocSymbol && (
         <div style={{
           position: 'absolute',
-          left: `calc(${leftPct}% + 8px - 1000px)`,
-          top: 8, bottom: 8,
-          width: 1000, zIndex: 55,
+          left: 8, top: 8, bottom: 8,
+          width: `calc(${leftPct}% - 16px)`,
+          zIndex: 55,
           background: '#171717',
           border: '1px solid rgba(255,255,255,0.12)',
           borderRadius: 10,
@@ -1629,20 +1688,25 @@ const [mtmCursor, setMtmCursor] = useState(0);
           display: 'flex', flexDirection: 'column',
           overflow: 'hidden',
         }}>
-          <OptionChain symbol={ocSymbol} expiries={ocExpiries} sessionToken={nubraSession} exchange={ocExchange} onClose={() => setOcOpen(false)} onAddLeg={addLeg} onLtpUpdateRef={{ current: onLtpUpdate }} lotSize={ocLotSize} instruments={instruments} ocSpotRef={ocSpotRef} />
+          <OptionChain symbol={ocSymbol} expiries={ocExpiries} sessionToken={nubraSession} exchange={ocExchange} onClose={() => setOcOpen(false)} onAddLeg={addLeg} onLtpUpdateRef={{ current: onLtpUpdate }} lotSize={ocLotSize} instruments={instruments} ocSpotRef={ocSpotRef} isHistoricalMode={isHistoricalMode} spotRefId={ocSpotRefId} />
         </div>
       )}
 
-      {/* Divider — 12px gap, draggable, no visible line */}
+      {/* Divider */}
       <div
         onMouseDown={onMouseDown}
-        onDoubleClick={() => setLeftPct(40)}
-        style={{ width: 12, flexShrink: 0, cursor: 'col-resize' }}
-      />
+        onDoubleClick={() => setLeftPct(45)}
+        style={{ width: 12, flexShrink: 0, cursor: 'col-resize', display: 'flex', alignItems: 'center', justifyContent: 'center' }}
+      >
+        <div style={{ width: 4, height: 32, borderRadius: 2, background: 'rgba(255,255,255,0.08)', transition: 'background 0.15s' }}
+          onMouseEnter={e => { (e.currentTarget as HTMLDivElement).style.background = 'rgba(255,255,255,0.22)'; }}
+          onMouseLeave={e => { (e.currentTarget as HTMLDivElement).style.background = 'rgba(255,255,255,0.08)'; }}
+        />
+      </div>
 
       {/* Right panel — Strategy Chart */}
-      <div style={{ flex: 1, background: '#171717', borderRadius: 10, overflow: 'hidden', border: '1px solid rgba(255,255,255,0.08)' }}>
-        <StrategyChart legs={legs} ocSymbol={ocSymbol} ocExchange={ocExchange} nubraInstruments={nubraInstruments} nubraIndexes={nubraIndexes} />
+      <div style={{ flex: 1, minWidth: 0, background: '#171717', borderRadius: 10, overflow: 'hidden', border: '1px solid rgba(255,255,255,0.08)' }}>
+        <StrategyChart legs={legs} ocSymbol={ocSymbol} ocExchange={ocExchange} nubraInstruments={nubraInstruments} nubraIndexes={nubraIndexes} isHistoricalMode={isHistoricalMode} />
       </div>
     </div>
   );
